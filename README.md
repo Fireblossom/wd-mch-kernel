@@ -1,93 +1,154 @@
-# WD My Cloud Home (RTD1295) 主线内核移植
+# WD My Cloud Home（RTD1295）Linux 6.18.2 移植
 
-把 WD My Cloud Home（Realtek RTD1295）从厂商 Android/4.9 内核迁移到
-Linux 6.18.2 + Debian 13。**2026-07-27 达成可用状态**：B 槽自建内核，
-四核 SMP、UART 真中断、千兆以太网、USB 3.0、Docker/OMV、NFS/SMB、软重启和
-SoC 温度监控均已通过实机验证；v46 又加入了免串口槽位切换和一次性网络救援。
-Debian 13 trixie 约 34 秒进入 graphical.target，断电后网络和 SSH 可无人值守恢复。
+本仓库为单盘版 WD My Cloud Home（Realtek RTD1295）提供 Linux 6.18.2
+板级适配源码，以及一套已在真机验证的 B 槽刷机包。
 
-## 硬件
+这不是 WD 官方固件，也不是完整的 Debian 安装器。现有刷机包假定设备已经安装
+Debian 13（arm64，根文件系统位于 `/dev/md1`）。目前只在一台单盘版
+My Cloud Home 上验证；My Cloud Home Duo 和其他 RTD1295 设备不在已验证范围内。
 
-| 项 | 值 |
+> 刷错分区可能使设备无法启动。首次操作必须连接 115200 8N1 串口、备份原分区，
+> 并且只写 B 槽。不要写 A 槽或 GOLD 救援槽。
+
+## 从哪里开始
+
+如果你只是想使用现成内核：
+
+1. 确认设备符合上面的适用条件。
+2. 下载 [`wd-mch-kernel-6.18.2-r1.tar.gz`](release/wd-mch-kernel-6.18.2-r1.tar.gz)。
+3. 阅读[刷机包说明](release/wd-mch-kernel-6.18.2-r1/README.md)。
+4. 按[刷机步骤](release/wd-mch-kernel-6.18.2-r1/docs/FLASHING.md)操作。
+5. 开始前先了解[回滚、槽位切换和网络救援](release/wd-mch-kernel-6.18.2-r1/docs/RESCUE.md)。
+
+如果你准备修改或移植内核，请从 `linux-6.18.2/`、本页的“源码与构建”和
+[`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md)开始。仓库中的早期调试笔记记录了
+探索过程，可能包含已经失效的结论，不应当作当前操作手册。
+
+## 当前推荐版本
+
+| 项目 | 内容 |
 |---|---|
-| SoC | Realtek RTD1295，Cortex-A53 ×4（v32 起全核可用） |
-| RAM / 盘 | 1 GiB / Intel SSDSC2KW256G8 256G SATA |
-| 串口 | 115200 8N1，UART0 @ 0x98007800 |
-| 引导 | 两阶段 U-Boot 2015.07（1st AArch32 → 2nd AArch64），`bootr` |
-| 网络 | 千兆 GMAC；设备与 TFTP 服务端地址由现场网络决定 |
+| 面向用户的发行版 | **r1** |
+| 上游内核基线 | Linux 6.18.2 |
+| 目标设备 | 单盘版 WD My Cloud Home / Realtek RTD1295 |
+| 目标启动槽 | B 槽；A 和 GOLD 保持原样 |
+| 根文件系统 | 已安装的 Debian 13 arm64，`/dev/md1` |
+| 对应源码 | 提交 `aeae8812a`，另加公开发布文档 |
+| 验证状态 | 真机冷启动、软重启、网络和 SSH 恢复均通过 |
 
-## 仓库布局
+普通用户只需要选择 `r1`，不需要从仓库里的 `v21`、`v38`、`v46` 等文件中挑选。
 
-| 路径 | 说明 |
-|---|---|
-| `linux-6.18.2/` | 构建树（**含本地补丁**，见下）。`.config` 已强制入库 |
-| `initramfs/` | 内嵌 initramfs 源（BusyBox + mdadm + init 脚本，含 `apply_rootfs_fixups`） |
-| `rtd1295_*.config` | merge_config 片段：基础系统、Docker/NAS、网络、USB、thermal 等 |
-| `rebuild_package_and_print_flash.sh` | 一键：编内核→patch Image 头→零填充→生成 fw_table（⚠️ 它不打印 DTB 刷写命令，DTB 要手动刷） |
-| `fw_table_v*.bin`、`rtd1295-*-v*-padded.dtb` | 历代产物；当前在役见下表 |
-| `extracted.dts` | 厂商 4.9 设备树反编译参考（irq mux / uart / i2c 节点照这里抄） |
-| `DEBUG_SESSION_2026-04-20.md` | 4 月会话记录，可信 |
-| `DRIVER_PORTING_GUIDE.md` 等旧 guide | ⚠️ 结论过时（还说 I2C 是阻塞项），只当历史参考 |
-| GPL 厂商包（未入库） | `~/nas/GPL_MCH_Monarch_*/`：spin table、GMAC 驱动等参考实现 |
+## 版本号为什么有好几种
 
-## 相对 vanilla 6.18.2 的本地改动
+开发日志保留了移植期间使用的内部编号。它们的含义如下：
 
-- `arch/arm64/boot/dts/realtek/rtd1295-wd-mycloud-home.dts` — 本板 DTS（历代演进全在注释里）
-- `arch/arm64/kernel/smp_spin_table.c` — release addr 非内存时用厂商访问模式（32 位设备写；v32 起）
-- `drivers/irqchip/irq-rtd129x.c/.h` — 厂商 irq mux 移植 + ACK-first 补丁；Kconfig 去掉 `if COMPILE_TEST` 门
-- `.config` — 含 `CONFIG_IRQ_RTD129X_MUX=y` + systemd 依赖（cgroups 等） 
+| 写法 | 含义 | 是否供用户选择 |
+|---|---|---|
+| `6.18.2` | 上游 Linux 内核版本 | 是，用于了解内核基线 |
+| `r1` | 本项目对外发布的整套刷机包版本 | **是，当前应选这个** |
+| `v21`…`v46` | 开发期间某次“内核 + DTB + fw_table”组合的流水号 | 否，仅用于追溯实验 |
+| 内核 `#35` | 本地编译计数，来自内核版本字符串 | 否 |
+| DTB `v22` | 开发期间设备树二进制的迭代号 | 否 |
 
-## 构建与刷机速查
+这些内部编号不是语义化版本、Git tag 或相互兼容性声明。例如开发组合 `v46`
+内部使用了 DTB `v22`；数字不同并不表示文件缺失。对外发布时三个文件已经改成
+中性文件名并固定为一套，必须一起使用：
 
-```bash
-# 服务器上打包（自动重编内核 + fw_table）
-./rebuild_package_and_print_flash.sh --version vNN --base-fw fw_table_v23.bin \
-    --dtb rtd1295-wd-mycloud-home-vNN-padded.dtb
-
-# DTB 手工管线（rebuild 脚本不管 DTB 编译）
-make -C linux-6.18.2 ARCH=arm64 dtbs
-dtc -I dtb -O dtb -p 16384 linux-6.18.2/.../rtd1295-wd-mycloud-home.dtb -o out.dtb
-# 零填充到 28672B；fw_table 里 DTB 校验和 = sum(bytes)&0xFFFFFFFF
+```text
+Image-6.18.2-mch
+mch.dtb
+fw_table.bin
 ```
 
-刷机流程见发布包中的
-[`docs/FLASHING.md`](release/wd-mch-kernel-6.18.2-r1/docs/FLASHING.md)；
-救援和槽位切换见
-[`docs/RESCUE.md`](release/wd-mch-kernel-6.18.2-r1/docs/RESCUE.md)。
-流程为断电→bootcode banner 后用 Esc 进入一阶段 `Realtek>`→TFTP→`sata write`→抓首启。
-B 槽地址：FW_TABLE `0x22/0x10`、FDT_B `0x31000/0x38`、KERNEL_B `0x33800/按大小`。
-**永不写 Gold 槽（sda9/10/16）**——那是 `sgboot` 救援路径。
+各内部里程碑解决了什么问题，见
+[`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md)。该文档用于维护和审计，不是下载清单。
 
-## 在役版本
+## 已验证功能
 
-| 件 | 版本 | 校验和 |
-|---|---|---|
-| 内核 | #35（v46：全功能 NAS + netrescue） | ✅ 实机验证 |
-| DTB | v22（四核、UART/GMAC、USB3、thermal、RTC 节点） | ✅ |
-| fw_table | v46 | ✅ |
+| 能力 | 状态 |
+|---|---|
+| Cortex-A53 四核 SMP | ✅ |
+| UART0 中断模式，115200 8N1 | ✅ |
+| 板载千兆以太网及出厂 MAC | ✅ |
+| 后置 USB 3.0 Type-A，5 Gbit/s | ✅ |
+| Debian 13 / systemd | ✅ |
+| Docker、OpenMediaVault 8 | ✅ |
+| NFS、SMB 所需 ACL/xattr、配额 | ✅ |
+| TUN、WireGuard、dm-crypt、FUSE、zram | ✅ |
+| 看门狗软重启 | ✅ |
+| SoC 温度读取和 thermal zone | ✅ |
+| B/A/GOLD 槽位切换、一次性网络救援 | ✅，限制见救援文档 |
 
-实测：4 CPU、ttyS0 irq 34、eth0 RTL8169SOC、USB 3.0 5Gbps（机械盘持续读取
-137 MB/s）、Docker/OMV 8、NFS/SMB、软重启和 thermal zone 均工作；断电重启后
-网络/SSH 无人值守恢复。发布包为
-[`wd-mch-kernel-6.18.2-r1.tar.gz`](release/wd-mch-kernel-6.18.2-r1.tar.gz)。
+USB 3.0 使用机械盘实测持续读取约 137 MB/s。实际速度取决于硬盘、文件系统和负载。
 
-回滚可走 A 槽厂商 4.9 内核或 GOLD 救援槽；B 槽历史稳定点包括 v42、v38、v36、
-v34、v32、v31、v27 和 v21。不要覆盖 A/GOLD 槽。
+## 刷写与回滚边界
 
-## 遗留项
+`r1` 中的内核、DTB 和 `fw_table` 是一个不可拆分的组合。`fw_table` 记录另外两个
+文件的长度和校验和，不能混用不同开发阶段的文件。
 
-1. ✅ ~~SMP 单核~~ —— v32 修复（`smp_spin_table.c`，git 0406c4e6c）
-2. ✅ ~~UART 轮询~~ —— v34 修复（git cc2bb90b4）。当年"bit2 清不掉"是探针假象：
-   ISO_ISR 是正常 W1C 事件锁存（bit0=WRITE_DATA，见厂商 rtk_iso.h），但 devmem
-   命令本身的串口流量会重新置位；真凶是 mux handler 里的 printk 在 console 串口上
-   自我喂养。教训：**console 所在总线的中断处理器里永远不要 printk**
-3. ✅ ~~以太网~~ —— v36 修复（git 28b3337）：厂商 r8169soc 移植 + 两处漏改的裸
-   clk_get 修掉 + NET_VENDOR_REALTEK 的 PCI 门放宽。⚠️ 同类教训第三次出现：
-   **驱动移植完成 ≠ 能被选上——每次都要查 Kconfig 依赖链能否成立**
-4. ✅ ~~USB/存储/NAS 功能~~ —— v37–v42 完成 Docker、NFS/ACL、软重启、
-   USB 3.0、thermal 等；详见对应提交。
-5. 当前小项：RTC 已注册但不走针（依赖 NTP）；r8169soc 偶发
-   `rtl_csiar_cond` 超时提示但不影响功能；u2host/u3host 是未接物理端口的空根集线器。
-6. netrescue 提供无密码 telnet root shell，只应在可信局域网中临时使用；
-   引导器不会自动递减尝试次数，槽位失败时也不会自动回滚，详见
-   [`docs/RESCUE.md`](release/wd-mch-kernel-6.18.2-r1/docs/RESCUE.md)。
+刷机只涉及以下 B 槽位置：
+
+| 内容 | SATA 起始扇区 | 写入扇区数 |
+|---|---:|---:|
+| `fw_table.bin` | `0x22` | `0x10` |
+| `mch.dtb` | `0x31000` | `0x38` |
+| `Image-6.18.2-mch` | `0x33800` | `0x7e60` |
+
+完整命令、传输大小检查和备份方法以
+[`FLASHING.md`](release/wd-mch-kernel-6.18.2-r1/docs/FLASHING.md)为准。
+不要覆盖 A 槽或 GOLD 槽；它们是主线内核无法启动时的独立退路。引导器不会自动
+递减尝试次数，也不会自动回滚，具体行为见
+[`RESCUE.md`](release/wd-mch-kernel-6.18.2-r1/docs/RESCUE.md)。
+
+## 源码与构建
+
+主要目录：
+
+| 路径 | 用途 |
+|---|---|
+| `linux-6.18.2/` | Linux 6.18.2 源码和本板补丁；`.config` 已入库 |
+| `initramfs/` | 内嵌 initramfs：BusyBox、mdadm、根文件系统交接和网络救援 |
+| `rtd1295_*.config` | systemd、NAS、网络、USB、thermal 等配置片段 |
+| `rebuild_package_and_print_flash.sh` | 维护者打包工具：修补 Realtek Image 头、填充并更新 `fw_table` |
+| `release/wd-mch-kernel-6.18.2-r1/` | 面向用户的 r1 文件和文档 |
+
+已入库 `.config` 中的 `CONFIG_INITRAMFS_SOURCE` 是构建服务器的绝对路径。换机器后
+先改成当前检出目录，再编译：
+
+```bash
+cd /path/to/wd-mch-kernel
+
+linux-6.18.2/scripts/config \
+  --file linux-6.18.2/.config \
+  --set-str INITRAMFS_SOURCE "$PWD/initramfs"
+
+make -C linux-6.18.2 ARCH=arm64 olddefconfig
+make -C linux-6.18.2 ARCH=arm64 -j"$(nproc)" Image dtbs
+```
+
+在非 arm64 主机交叉编译时，还需要设置合适的 `CROSS_COMPILE`。上一步生成的是原始
+Linux `Image`，**不能直接写盘**；设备要求兼容头、固定填充以及与 DTB 匹配的
+`fw_table`。`rebuild_package_and_print_flash.sh` 是当前维护者环境使用的打包工具，
+其中仍有 `/home/ubuntu/linux` 绝对路径，外部使用前应先审阅并参数化。
+
+相对原版 Linux 6.18.2，核心板级改动包括：
+
+- WD My Cloud Home 的 RTD1295 DTS；
+- RTD129x interrupt mux 及 UART 中断处理；
+- RTD1295 CPU release-address 的设备寄存器访问；
+- 板载 Realtek GMAC 支持；
+- DWC3/PHY、USB 3.0 lane 设置；
+- RTD129x thermal 和看门狗重启；
+- 适用于 Debian 13、容器和 NAS 的内核配置。
+
+## 已知限制
+
+- RTC 能注册但不走针，系统时间依赖 NTP。
+- `r8169soc` 偶尔打印 `rtl_csiar_cond` 超时提示，当前实测不影响网络。
+- 网络救援提供无密码 telnet root shell，只能在可信局域网内临时使用。
+- 当前测试覆盖一台设备，不能据此保证其他硬件修订或其他 RTD1295 产品兼容。
+
+## 许可证与来源
+
+Linux 内核及本仓库中的相应修改遵循 GPL-2.0。源码基线、厂商参考资料和发布包对应
+关系见 [`SOURCES.md`](release/wd-mch-kernel-6.18.2-r1/SOURCES.md)。
