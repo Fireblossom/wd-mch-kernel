@@ -1,9 +1,9 @@
 # WD My Cloud Home (RTD1295) 主线内核移植
 
 把 WD My Cloud Home（Realtek RTD1295）从厂商 Android/4.9 内核迁移到主线
-Linux 6.18.2 + Debian 13。**2026-07-27 起设备可用**：B 槽跑自建内核，
+Linux 6.18.2 + Debian 13。**2026-07-27 起设备可用**：B 槽跑自建内核（v32 起**四核 SMP**），
 Debian 13 trixie 约 34 秒进 graphical.target，串口 `MCH-Debian login:`
-可登录。SMP / UART 中断 / 以太网见「遗留项」。
+可登录。UART 中断 / 以太网见「遗留项」。
 
 **总日志（最详细、含全部根因和踩坑）在 Mac 上：`~/.wd-debug/WORKLOG.md`。**
 本 README 只负责让新会话/新人在这个仓库里快速定位。
@@ -12,7 +12,7 @@ Debian 13 trixie 约 34 秒进 graphical.target，串口 `MCH-Debian login:`
 
 | 项 | 值 |
 |---|---|
-| SoC | Realtek RTD1295，Cortex-A53 ×4（当前单核，见遗留项） |
+| SoC | Realtek RTD1295，Cortex-A53 ×4（v32 起全核可用） |
 | RAM / 盘 | 1 GiB / Intel SSDSC2KW256G8 256G SATA |
 | 串口 | 115200 8N1，UART0 @ 0x98007800（Mac 侧 /dev/cu.usbserial-AY4PF6MZ） |
 | 引导 | 两阶段 U-Boot 2015.07（1st AArch32 → 2nd AArch64），`bootr` |
@@ -61,16 +61,17 @@ B 槽地址：FW_TABLE `0x22/0x10`、FDT_B `0x31000/0x38`、KERNEL_B `0x33800/�
 
 | 件 | 版本 | 校验和 |
 |---|---|---|
-| 内核 | #21（v32：#20 + smp_spin_table MMIO 补丁） | 见 git log |
-| DTB | v17（= v16 + spin-table ×4；mux disabled、uart 轮询） | 0x00047fab |
-| fw_table | v32 | — |
+| 内核 | #21（v32：#20 + smp_spin_table MMIO 补丁）cksum 0x3fdfa749 | ✅ 实机四核验证 |
+| DTB | v17（= v16 + spin-table ×4；mux disabled、uart 轮询）cksum 0x00047fab | ✅ |
+| fw_table | v32（hdr 0x4484） | ✅ |
 
 回滚链：v31（#20+v16，稳态可登录）→ v27（#19+v14）→ v21（#15+v11，4 月老稳态）。
 产物都在 Mac `~/.wd-debug/tftp/`。
 
 ## 遗留项
 
-1. ~~SMP 单核~~ —— v32 尝试中（本 README 落笔时正在首测）
+1. ✅ ~~SMP 单核~~ —— v32 实机验证 `smp: Brought up 1 node, 4 CPUs`（补丁见
+   `arch/arm64/kernel/smp_spin_table.c`，git 0406c4e6c）
 2. UART 轮询模式：IRQ 链路已验证（ttyS0 virq 34），卡在 ISO_ISR(0x98007000) bit2
    上电恒 1 清不掉 → 需登录后 devmem 摸寄存器语义（v16/v17 DTS 注释有分析）
 3. 以太网无驱动：厂商 GMAC 在 GPL 包 `drivers/net/ethernet/realtek/`，或 USB 网卡过渡
