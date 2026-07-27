@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: (GPL-2.0-or-later OR BSD-2-Clause)
+/*
+ * WD My Cloud Home device tree
+ * Based on Realtek RTD1295 SoC
+ *
+ * Ported from kernel 4.9.330 to 6.18.2
+ * Based on third-party Debian device tree from Russian forum
+ * Optimized for Debian/Linux (not Android)
+ */
+
+/dts-v1/;
+
+#include "rtd1295.dtsi"
+
+/ {
+	compatible = "wd,mycloud-home", "realtek,rtd1295";
+	model = "WD My Cloud Home";
+
+	/*
+	 * NOTE: The third-party Debian tree this was derived from reports 1 GiB RAM.
+	 * Do NOT assume 2 GiB unless confirmed on the target device.
+	 *
+	 * Also note: this SoC is ARM64, but the upstream RTD129x DTS uses
+	 * #address-cells = <1> / #size-cells = <1> at the root (32-bit cells).
+	 * That's fine as long as all addresses are below 4 GiB.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x40000000>;
+	};
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+	};
+
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0x98007800 console=ttyS0,115200 root=/dev/sda9 rootfstype=ext4 rootwait rw init=/bin/sh";
+		stdout-path = "serial0:115200n8";
+	};
+
+	/* Reserved memory - clean version without vendor rsvmem-remap overlaps */
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x02000000>;
+			linux,cma-default;
+		};
+
+		/* ramoops for kernel crash log persistence */
+		ramoops@22000000 {
+			compatible = "ramoops";
+			reg = <0x22000000 0x200000>;
+			record-size = <0x4000>;
+			console-size = <0x100000>;
+			ftrace-size = <0x4000>;
+		};
+	};
+
+	/* Note: ION memory management is simplified for Debian
+	 * Original Debian version kept minimal ION config for compatibility
+	 * Full ION nodes will be added if needed
+	 */
+};
+
+&rbus {
+	/*
+	 * Vendor RTD129x interrupt mux.
+	 *
+	 * The vendor I2C binding uses two-cell interrupts (<bank line>) with
+	 * interrupt-parent pointing at this mux. The mux itself is chained from
+	 * two GIC SPIs (40 and 41) in the extracted DTS.
+	 */
+	mux_intc: interrupt-controller@1b000 {
+		compatible = "Realtek,rtk-irq-mux";
+		/* v16: disabled for now. With the node enabled, ISO_ISR bit2 reads
+		 * as 1 from power-on and W1C does not clear it, so the chained
+		 * handler on GIC SPI 41 spins in the "status is not change" path
+		 * (~4 log lines/s, self-sustaining via console TX). Needs devmem
+		 * poking of 0x98007000 ISR semantics on a live system before the
+		 * uart can move off polling. Everything below is the full vendor
+		 * contract and is known-good otherwise (ttyS0 got virq 34).
+		 */
+		status = "disabled";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		/* v15: full vendor contract for irq-rtd129x.c - two muxes:
+		 * index 0 = MISC @ 0x1b000 (GIC SPI 40), index 1 = ISO @ 0x7000
+		 * (GIC SPI 41). intr-status/intr-en are per-mux register offsets;
+		 * without them the driver reads uninitialized stack values.
+		 */
+		Realtek,mux-nr = <2>;
+		intr-status = <0x0c 0x00>;
+		intr-en = <0x80 0x40>;
+
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 40 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH>;
+
+		/* register windows used by the vendor driver */
+		reg = <0x1b000 0x100>, <0x7000 0x100>;
+	};
+
+	/*
+	 * I2C buses (vendor binding: "realtek,rtk-i2c").
+	 */
+	i2c0: i2c@7d00 {
+		compatible = "realtek,rtk-i2c";
+		reg = <0x7d00 0x100>, <0x7000 0x100>;
+		interrupt-parent = <&mux_intc>;
+		interrupts = <1 8>;
+		i2c-num = <0>;
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pmic@12 {
+			compatible = "gmt,g2227";
+			reg = <0x12>;
+			status = "okay";
+
+			regulators {
+				compatible = "gmt,g2227-regulator";
+				status = "okay";
+
+				dc1 { regulator-boot-on; regulator-always-on; regulator-name = "vd33"; regulator-min-microvolt = <3000000>; regulator-max-microvolt = <3300000>; regulator-initial-mode = <1>; };
+				dc2 { regulator-boot-on; regulator-always-on; regulator-name = "cpudvs"; regulator-min-microvolt = <800000>; regulator-max-microvolt = <1187500>; regulator-initial-mode = <0>; regulator-state-mem { regulator-off-in-suspend; }; };
+				dc3 { regulator-boot-on; regulator-always-on; regulator-name = "gpudvs"; regulator-min-microvolt = <800000>; regulator-max-microvolt = <1187500>; regulator-initial-mode = <0>; regulator-ramp-delay = <625>; regulator-state-mem { regulator-off-in-suspend; }; };
+				dc4 { regulator-boot-on; regulator-always-on; regulator-name = "ddr"; regulator-min-microvolt = <1500000>; regulator-max-microvolt = <1500000>; regulator-initial-mode = <0>; regulator-state-coldboot { regulator-off-in-suspend; }; };
+				dc5 { regulator-boot-on; regulator-always-on; regulator-name = "iso"; regulator-min-microvolt = <800000>; regulator-max-microvolt = <1187500>; regulator-initial-mode = <0>; };
+				dc6 { regulator-boot-on; regulator-always-on; regulator-name = "top"; regulator-min-microvolt = <800000>; regulator-max-microvolt = <1187500>; regulator-initial-mode = <0>; regulator-state-mem { regulator-off-in-suspend; }; };
+				ldo2 { regulator-boot-on; regulator-always-on; regulator-name = "ldo2"; regulator-min-microvolt = <1500000>; regulator-max-microvolt = <1900000>; regulator-initial-mode = <0>; regulator-state-mem { regulator-off-in-suspend; }; };
+				ldo3 { regulator-boot-on; regulator-always-on; regulator-name = "ldo3"; regulator-min-microvolt = <800000>; regulator-max-microvolt = <1200000>; regulator-initial-mode = <0>; regulator-state-mem { regulator-off-in-suspend; }; };
+			};
+		};
+	};
+
+	i2c1: i2c@7c00 {
+		compatible = "realtek,rtk-i2c";
+		reg = <0x7c00 0x100>, <0x7000 0x100>;
+		interrupt-parent = <&mux_intc>;
+		interrupts = <1 11>;
+		i2c-num = <1>;
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	i2c2: i2c@1b700 {
+		compatible = "realtek,rtk-i2c";
+		reg = <0x1b700 0x100>, <0x1b00c 0x100>;
+		interrupt-parent = <&mux_intc>;
+		interrupts = <0 26>;
+		i2c-num = <2>;
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	i2c3: i2c@1b900 {
+		compatible = "realtek,rtk-i2c";
+		reg = <0x1b900 0x100>, <0x1b00c 0x100>;
+		interrupt-parent = <&mux_intc>;
+		interrupts = <0 23>;
+		i2c-num = <3>;
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	i2c4: i2c@1ba00 {
+		compatible = "realtek,rtk-i2c";
+		reg = <0x1ba00 0x100>, <0x1b00c 0x100>;
+		interrupt-parent = <&mux_intc>;
+		interrupts = <0 15>;
+		i2c-num = <4>;
+		status = "disabled";
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	i2c5: i2c@1bb00 {
+		compatible = "realtek,rtk-i2c";
+		reg = <0x1bb00 0x100>, <0x1b00c 0x100>;
+		interrupt-parent = <&mux_intc>;
+		interrupts = <0 14>;
+		i2c-num = <5>;
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <0>;
+	};
+
+	/*
+	 * SATA PHY + AHCI controller.
+	 * PHY driver: drivers/phy/realtek/phy-rtk-sata.c (mainline)
+	 * AHCI reg shrunk to 0xf00 to avoid overlap with PHY at 0x3ff00.
+	 */
+	sata_phy: sata-phy@3ff00 {
+		compatible = "Realtek,rtk-sata-phy";
+		reg = <0x3ff00 0x100>, <0x1a980 0x10>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		#phy-cells = <1>;
+		status = "okay";
+
+		sata-phy@0 {
+			reg = <0>;
+			spread-spectrum = <0>;
+		};
+	};
+
+	sata@3f000 {
+		compatible = "generic-ahci";
+		reg = <0x3f000 0xf00>;
+		interrupts = <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH>;
+		phys = <&sata_phy 0>;
+		phy-names = "sata-phy";
+		status = "okay";
+	};
+
+	/*
+	 * GMAC — RTD1295 SoC-internal Gigabit Ethernet.
+	 * Uses vendor platform driver r8169soc (compatible "Realtek,r8168").
+	 *
+	 * Two register ranges, both RBUS-relative:
+	 *   0x16000  1K  — MAC registers        (absolute 0x98016000)
+	 *   0x7000   1K  — ISO domain registers (absolute 0x98007000)
+	 *
+	 * The driver uses mmio_clkaddr (range 1) for clock-gate and reset
+	 * control of the ETN block.  No RTD1295 clock driver exists in
+	 * mainline 6.18, so clocks are declared as optional in r8169soc.c
+	 * (hardware clocks remain enabled from the vendor bootloader at
+	 * kexec time).
+	 *
+	 * output-mode = 0 → embedded PHY (RGMII internal).
+	 * mac-version  = 0x2a → RTL8168H embedded MAC.
+	 */
+	gmac: ethernet@16000 {
+		compatible = "Realtek,r8168";
+		reg = <0x16000 0x1000>, <0x7000 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 22 IRQ_TYPE_LEVEL_HIGH>;
+		resets = <&iso_reset RTD1295_ISO_RSTN_GMAC>,
+			 <&iso_reset RTD1295_ISO_RSTN_GPHY>;
+		reset-names = "gmac", "gphy";
+		output-mode = <0>;
+		mac-version = <0x2a>;
+		ext-phy-id = <1>;
+		led-cfg = <0x804f>;
+		rtl-config = <1>;
+		rtl-features = <2>;
+		eee = <1>;
+		rgmii-voltage = <1>;
+		rgmii-tx-delay = <0>;
+		rgmii-rx-delay = <0>;
+		status = "okay";
+	};
+};
+
+&uart0 {
+	/* v16: polled (no interrupt wiring) while mux_intc is disabled -
+	 * dw8250 ENXIO fallback, the console mode every working boot used.
+	 */
+	status = "okay";
+};
+
+&uart1 {
+	status = "disabled";
+};
+
+&uart2 {
+	status = "disabled";
+};
+
+/* v13: the four &cpuN spin-table blocks (v12) are removed again - mainline
+ * spin-table hard-hangs 6.18 at smp bringup on this BL31 (release addr
+ * 0x9801aa44 is device-register space; vendor semantics differ). Single
+ * core until a proper rtk spin-table enable-method is ported.
+ */
+
+/*
+ * Vendor 4.9 uses a Realtek-specific "rtk-spin-table" CPU bring-up path.
+ * Mainline arm64 doesn't know that cpu_ops name, but it does support the
+ * generic spin-table protocol, which uses the same release address polling
+ * model for secondaries.
+ */
+
+
+
+
+/* TODO: Port I2C controllers from extracted.dts
+ * - i2c@0x98007D00 (I2C0) with PMIC g2227@12
+ * - i2c@0x98007C00 (I2C1)
+ * - i2c@0x9801B700 (I2C2)
+ * - i2c@0x9801B900 (I2C3)
+ * - i2c@0x9801BA00 (I2C4)
+ * - i2c@0x9801BB00 (I2C5)
+ */
+
+/* TODO: Port USB controllers
+ * - dwc3_drd_usb2phy
+ * - dwc3_drd_usb3phy
+ * - rtk_dwc3_drd
+ * - rtk_dwc3_u2host
+ */
+
+/* TODO: Port SATA controller
+ * - sata_phy@9803FF60
+ * - sata@9803F000
+ */
+
+/*
+ * The GMAC node goes inside &rbus (both reg ranges are RBUS-relative).
+ * See note below the &rbus block for details.
+ */
+
+/* TODO: Port GPIO and pinctrl
+ * - pinctrl@9801A000
+ * - rtk_iso_gpio@98007100
+ * - rtk_misc_gpio@9801b100
+ */
+
+/* TODO: Port power management
+ * - power-management@0
+ * - cpu-dvfs
+ */
+
+/* TODO: Port thermal zones
+ * - thermal-zones
+ */
