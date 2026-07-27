@@ -88,6 +88,84 @@ handoff_to_debian_rootfs() {
   exec /bin/busybox switch_root -c /dev/console "$root" "$init"
 }
 
+# ---------------------------------------------------------------- netrescue
+# A serial cable is not always available. When the handoff to the real root
+# filesystem fails - or when the user asks for it by dropping a "netrescue"
+# marker file on the FAT32 CONFIG partition - bring up the network and offer
+# a telnet root shell so the box can be repaired remotely.
+#
+# NOTE: the rescue shell is unauthenticated. It is one-shot (the marker is
+# consumed on use) and only reachable while the box sits in the initramfs.
+CFG_DEV=/dev/sda18
+CFG_MNT=/cfg
+
+rescue_marker_present() {
+  mkdir -p "$CFG_MNT"
+  mount -t vfat "$CFG_DEV" "$CFG_MNT" 2>/dev/null || return 1
+  if [ -f "$CFG_MNT/netrescue" ]; then
+    rm -f "$CFG_MNT/netrescue"        # one-shot: never strand the box here
+    sync
+    umount "$CFG_MNT" 2>/dev/null
+    return 0
+  fi
+  umount "$CFG_MNT" 2>/dev/null
+  return 1
+}
+
+start_netrescue() {
+  reason="$1"
+  echo ""
+  echo "[initramfs] ===== NETWORK RESCUE MODE ====="
+  echo "[initramfs] reason: $reason"
+
+  [ -d /etc ] || mkdir -p /etc
+  [ -f /etc/passwd ] || echo "root::0:0:root:/:/bin/sh" > /etc/passwd
+
+  # telnetd needs a pty for every login; without devpts it accepts the
+  # connection, fails to allocate one and exits, so the first client kills
+  # the rescue shell.
+  mkdir -p /dev/pts
+  is_mounted /dev/pts || mount -t devpts devpts /dev/pts
+
+  ifconfig lo 127.0.0.1 up 2>/dev/null
+  ip link set eth0 up 2>/dev/null
+
+  echo "[initramfs] requesting a DHCP lease on eth0 ..."
+  udhcpc -i eth0 -s /etc/udhcpc.script -t 10 -T 2 -A 3 -n -q 2>/dev/null
+
+  addr=$(ip -4 addr show eth0 2>/dev/null | sed -n "s/.*inet \([0-9.]*\).*/\1/p" | head -1)
+  if [ -z "$addr" ]; then
+    echo "[initramfs] DHCP failed, falling back to 192.168.1.222/24"
+    ip addr add 192.168.1.222/24 dev eth0 2>/dev/null
+    addr=192.168.1.222
+  fi
+
+  # Assemble the RAID members so the rescue user can mount and repair the
+  # real root filesystem (this is the whole point of the rescue). Harmless
+  # if they are already up.
+  if [ -x /sbin/mdadm ]; then
+    /sbin/mdadm --assemble --scan --auto=yes >/dev/null 2>&1 || true
+  fi
+
+  telnetd -l /bin/sh 2>/dev/null &
+  tcpsvd -vE 0.0.0.0 21 ftpd -w / 2>/dev/null &
+
+  # IPv6 comes up on its own from router advertisements; report it so the
+  # box stays reachable on v6-only networks.
+  addr6=$(ip -6 addr show eth0 scope global 2>/dev/null | sed -n "s/.*inet6 \([0-9a-f:]*\).*/\1/p" | head -1)
+
+  echo "[initramfs]"
+  echo "[initramfs]   telnet $addr        <- root shell, no password"
+  echo "[initramfs]   ftp    $addr        <- upload/download files"
+  [ -n "$addr6" ] && echo "[initramfs]   telnet $addr6   <- same shell over IPv6"
+  echo "[initramfs]"
+  echo "[initramfs] to repair the system root:  mount /dev/md1 /mnt"
+  echo "[initramfs] disks:"
+  cat /proc/partitions
+  [ -f /proc/mdstat ] && grep -E "^md" /proc/mdstat
+  echo "[initramfs] ================================"
+}
+
 try_boot_debian_rootfs() {
   if [ -x /sbin/mdadm ]; then
     echo "[initramfs] mdadm found, assembling arrays"
@@ -219,6 +297,14 @@ enable_usb_power() {
 enable_usb_power
 
 echo "[initramfs] booted. kernel cmdline: $(cat /proc/cmdline)"
+
+if rescue_marker_present; then
+  start_netrescue "requested via netrescue marker on the CONFIG partition"
+  echo "[initramfs] rescue shell on the serial console:"
+  /bin/sh -i
+  echo "[initramfs] rescue shell exited, keeping init alive"
+  while true; do sleep 3600; done
+fi
 echo "[initramfs] quick reboot: reboot -f  or  reboot-now"
 echo "[initramfs] block devices:"
 cat /proc/partitions
@@ -269,6 +355,8 @@ for p in /dev/sda9 /dev/sda19 /dev/sda20 /dev/sda21 /dev/sda22 /dev/sda23 /dev/s
     umount /newroot
   fi
 done
+
+start_netrescue "no bootable root filesystem was found"
 
 echo "[initramfs] dropping to shell"
 /bin/sh -i

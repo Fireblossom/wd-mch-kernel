@@ -1,0 +1,108 @@
+#!/bin/sh
+# mch-boot - select the WD My Cloud Home boot target without a serial cable.
+#
+# The first-stage bootloader reads a 16-byte file "bootConfig" from the FAT32
+# CONFIG partition (sda18) formatted as  <bootState>:<nbr>:<bna>:;
+#   bootState 0 NO_OTA        boot CBR (the committed slot)
+#             1 INIT          set CBR=A permanently, then boot A
+#             2 OTA_TRIGGERED boot NBR (needs 1 <= bna <= 5)
+#             3 OTA_PASSED    commit NBR as the new CBR, then boot it
+#             4 OTA_FAILED    boot CBR
+#             5 RECOVERY      boot the factory GOLD rescue image
+#   nbr       next boot region: A, B or F (none)
+# Slot A = fw_table types KERNEL/KERNEL_DT/KERNEL_ROOTFS (vendor 4.9 + Debian)
+# Slot B = types RESCUE_KERNEL/RESCUE_DT (mainline 6.18 kernel)
+set -e
+
+CFGDEV=/dev/sda18
+MNT=/run/mch-boot-cfg
+SELF=$(basename "$0")
+
+die() { echo "$SELF: $*" >&2; exit 1; }
+
+mount_cfg() {
+	mkdir -p "$MNT"
+	mountpoint -q "$MNT" || mount -t vfat "$CFGDEV" "$MNT" ||
+		die "cannot mount $CFGDEV (run as root?)"
+}
+umount_cfg() { sync; mountpoint -q "$MNT" && umount "$MNT" || true; }
+
+write_cfg() {
+	mount_cfg
+	cp "$MNT/bootConfig" "$MNT/bootConfig.bak" 2>/dev/null || true
+	printf '%s' "$1" > "$MNT/bootConfig"
+	printf '%s' "$1" | od -c | head -1
+	umount_cfg
+	echo "$SELF: bootConfig set to '$1' - reboot to take effect"
+}
+
+case "${1:-status}" in
+status)
+	mount_cfg
+	cfg=$(cat "$MNT/bootConfig" 2>/dev/null | tr -d '\0')
+	umount_cfg
+	state=$(echo "$cfg" | cut -d: -f1)
+	case "$state" in
+	0) name="NO_OTA (boot committed slot)" ;;
+	1) name="INIT (commit A, boot A)" ;;
+	2) name="OTA_TRIGGERED (boot next-boot-region)" ;;
+	3) name="OTA_PASSED (commit and boot NBR)" ;;
+	4) name="OTA_FAILED (boot committed slot)" ;;
+	5) name="RECOVERY (boot GOLD rescue)" ;;
+	*) name="unknown" ;;
+	esac
+	echo "bootConfig     : $cfg"
+	echo "  bootState    : $state - $name"
+	echo "  next region  : $(echo "$cfg" | cut -d: -f2)"
+	echo "  boot attempts: $(echo "$cfg" | cut -d: -f3)"
+	echo "running kernel : $(uname -r) ($(uname -v | grep -o '#[0-9]*'))"
+	if [ -r /proc/device-tree/factory/cbr ]; then
+		echo "committed slot : $(tr -d '\0' < /proc/device-tree/factory/cbr)"
+	fi
+	;;
+a|A)     write_cfg "2:A:1:;" ;;
+b|B)     write_cfg "2:B:1:;" ;;
+commit)
+	mount_cfg; cfg=$(tr -d '\0' < "$MNT/bootConfig"); umount_cfg
+	nbr=$(echo "$cfg" | cut -d: -f2)
+	[ "$nbr" = "A" ] || [ "$nbr" = "B" ] ||
+		die "no slot is being trialled (next region is '$nbr')"
+	write_cfg "3:$nbr:0:;"
+	;;
+gold)        write_cfg "5:F:0:;" ;;
+netrescue|rescue)
+	mount_cfg
+	: > "$MNT/netrescue"
+	umount_cfg
+	echo "$SELF: netrescue armed - the next boot stops in the initramfs and"
+	echo "  offers a telnet root shell on the LAN instead of starting Debian."
+	echo "  It is one-shot: the boot after that is normal again."
+	;;
+disarm)
+	mount_cfg
+	rm -f "$MNT/netrescue"
+	umount_cfg
+	echo "$SELF: netrescue disarmed"
+	;;
+normal)      write_cfg "0:F:0:;" ;;
+*)
+	cat <<USAGE
+usage: $SELF [status|a|b|commit|gold|normal]
+
+  status   show the current boot configuration (default)
+  a        next boot: slot A - vendor 4.9 kernel + this same Debian
+  b        next boot: slot B - mainline 6.18 kernel
+  commit   make the slot currently being trialled the permanent one
+  gold     next boot: factory GOLD rescue image
+  rescue   next boot: stop in the initramfs, telnet root shell over the LAN
+           (one-shot; also happens automatically if the root filesystem
+           cannot be mounted). WARNING: that shell has no password.
+  disarm   cancel a pending "rescue"
+  normal   clear any trial, boot the committed slot
+
+The bootloader does NOT count failed attempts: a slot selected here keeps
+being booted until you change it again. Always leave one slot known-good.
+USAGE
+	exit 1
+	;;
+esac
