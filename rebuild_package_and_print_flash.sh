@@ -1,97 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Rebuild kernel Image, package firmware table, and always print flash commands.
-# Example:
-#   ./rebuild_package_and_print_flash.sh --version v15 --base-fw fw_table_v14.bin
+# Build a WD My Cloud Home kernel and create a self-consistent flashing
+# package. The raw Linux Image is never copied directly: this script applies
+# the RTD1295 header values, pads the Image and DTB, and updates fw_table.
 
-ROOT_DIR="/home/ubuntu/linux"
-KERNEL_DIR="$ROOT_DIR/linux-6.18.2"
-DTB_FILE_DEFAULT="rtd1295-wd-mycloud-home-v11-padded.dtb"
-SERVER_DEFAULT="ubuntu@100.115.19.12"
-MDADM_PACK_DEFAULT="$ROOT_DIR/mdadm-pack.tar.gz"
-DEBIAN13_TAR_DEFAULT="$ROOT_DIR/MyCloudHome_Debian13_v6.0/linux/linux.tar.xz"
-
-VERSION=""
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+KERNEL_VERSION="6.18.40"
+RELEASE_NAME="r2-rc1"
+ARCH="${ARCH:-arm64}"
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')}"
+BUILD_DIR=""
+OUTPUT_DIR=""
 BASE_FW=""
-DTB_FILE="$DTB_FILE_DEFAULT"
-SERVER="$SERVER_DEFAULT"
-MDADM_PACK="$MDADM_PACK_DEFAULT"
-
-prepare_initramfs_mdadm() {
-	local initramfs_dir="$ROOT_DIR/initramfs"
-	local tmp_dir
-
-	if [[ ! -f "$MDADM_PACK" ]]; then
-		echo "[warn] mdadm pack not found: $MDADM_PACK (md root assembly may fail)"
-		return 0
-	fi
-
-	tmp_dir="$(mktemp -d)"
-	tar -xzf "$MDADM_PACK" -C "$tmp_dir"
-
-	mkdir -p "$initramfs_dir/sbin" "$initramfs_dir/lib" "$initramfs_dir/lib/aarch64-linux-gnu"
-	install -m 0755 "$tmp_dir/mdadm-pack/mdadm" "$initramfs_dir/sbin/mdadm"
-	cp -a "$tmp_dir/mdadm-pack/lib/." "$initramfs_dir/lib/"
-
-	if [[ -f "$DEBIAN13_TAR_DEFAULT" ]]; then
-		tar -xJf "$DEBIAN13_TAR_DEFAULT" --to-stdout ./usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 > "$initramfs_dir/lib/ld-linux-aarch64.so.1"
-		tar -xJf "$DEBIAN13_TAR_DEFAULT" --to-stdout ./usr/lib/aarch64-linux-gnu/libcap.so.2.75 > "$initramfs_dir/lib/aarch64-linux-gnu/libcap.so.2.75"
-		tar -xJf "$DEBIAN13_TAR_DEFAULT" --to-stdout ./usr/lib/aarch64-linux-gnu/libudev.so.1.7.10 > "$initramfs_dir/lib/aarch64-linux-gnu/libudev.so.1.7.10"
-
-		chmod 0755 "$initramfs_dir/lib/ld-linux-aarch64.so.1"
-		chmod 0644 "$initramfs_dir/lib/aarch64-linux-gnu/libcap.so.2.75" "$initramfs_dir/lib/aarch64-linux-gnu/libudev.so.1.7.10"
-		ln -sf libcap.so.2.75 "$initramfs_dir/lib/aarch64-linux-gnu/libcap.so.2"
-		ln -sf libudev.so.1.7.10 "$initramfs_dir/lib/aarch64-linux-gnu/libudev.so.1"
-	else
-		echo "[warn] cannot find loader/lib source: $DEBIAN13_TAR_DEFAULT"
-	fi
-
-	rm -rf "$tmp_dir"
-	echo "[initramfs] mdadm runtime injected"
-}
 
 usage() {
 	cat <<'EOF'
 Usage:
-	rebuild_package_and_print_flash.sh --version vNN --base-fw fw_table_vNN.bin [options]
+  ./rebuild_package_and_print_flash.sh [options]
 
-Required:
-	--version NAME        Output tag, e.g. v15
-	--base-fw FILE        Base fw table file in /home/ubuntu/linux, e.g. fw_table_v14.bin
+Options:
+  --kernel-version VERSION  Kernel source directory suffix (default: 6.18.40)
+  --release NAME            Package release name (default: r2-rc1)
+  --build-dir DIR           Out-of-tree build directory
+  --output-dir DIR          Package directory
+  --base-fw FILE            8192-byte fw_table used as the structural template
+  --jobs N                  Parallel build jobs
+  -h, --help                Show this help
 
-Optional:
-	--dtb FILE            DTB padded file name in /home/ubuntu/linux
-	--server USER@HOST    SCP source host shown in printed commands
-	--mdadm-pack FILE     mdadm dependency bundle tar.gz (default: /home/ubuntu/linux/mdadm-pack.tar.gz)
+Environment:
+  ARCH, CROSS_COMPILE, JOBS, KBUILD_BUILD_USER and KBUILD_BUILD_HOST are
+  honored. SOURCE_DATE_EPOCH defaults to the timestamp of the current commit.
 
-This script always:
-1) recompiles Image
-2) generates Image-6.18.2-<version>-raw-padded and fw_table_<version>.bin
-3) prints Mac download commands and WD flash commands
+The script builds Image and DTBs, creates all files under flash/, validates
+their internal sizes and checksums, and writes a deterministic .tar.gz archive
+next to the package directory.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		--version)
-			VERSION="$2"
+		--kernel-version)
+			KERNEL_VERSION="$2"
+			shift 2
+			;;
+		--release)
+			RELEASE_NAME="$2"
+			shift 2
+			;;
+		--build-dir)
+			BUILD_DIR="$2"
+			shift 2
+			;;
+		--output-dir)
+			OUTPUT_DIR="$2"
 			shift 2
 			;;
 		--base-fw)
 			BASE_FW="$2"
 			shift 2
 			;;
-		--dtb)
-			DTB_FILE="$2"
-			shift 2
-			;;
-		--server)
-			SERVER="$2"
-			shift 2
-			;;
-		--mdadm-pack)
-			MDADM_PACK="$2"
+		--jobs)
+			JOBS="$2"
 			shift 2
 			;;
 		-h|--help)
@@ -100,105 +70,270 @@ while [[ $# -gt 0 ]]; do
 			;;
 		*)
 			echo "Unknown argument: $1" >&2
-			usage
-			exit 1
+			usage >&2
+			exit 2
 			;;
 	esac
 done
 
-if [[ -z "$VERSION" || -z "$BASE_FW" ]]; then
-	usage
+KERNEL_DIR="$ROOT_DIR/linux-$KERNEL_VERSION"
+PACKAGE_NAME="wd-mch-kernel-$KERNEL_VERSION-$RELEASE_NAME"
+BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build/linux-$KERNEL_VERSION}"
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/release/$PACKAGE_NAME}"
+BASE_FW="${BASE_FW:-$ROOT_DIR/release/wd-mch-kernel-6.18.2-r1/flash/fw_table.bin}"
+FLASH_DIR="$OUTPUT_DIR/flash"
+ARCHIVE="$ROOT_DIR/release/$PACKAGE_NAME.tar.gz"
+IMAGE_NAME="Image-$KERNEL_VERSION-mch"
+SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT_DIR" show -s --format=%ct HEAD)}"
+KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-Fireblossom}"
+KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-wd-mch-builder}"
+
+for required in \
+	"$KERNEL_DIR/Makefile" \
+	"$KERNEL_DIR/.config" \
+	"$ROOT_DIR/initramfs/init" \
+	"$BASE_FW" \
+	"$OUTPUT_DIR/README.md" \
+	"$OUTPUT_DIR/SOURCES.md" \
+	"$OUTPUT_DIR/docs/FLASHING.md" \
+	"$OUTPUT_DIR/docs/RESCUE.md" \
+	"$OUTPUT_DIR/tools/mch-boot"
+do
+	if [[ ! -e "$required" ]]; then
+		echo "Required input is missing: $required" >&2
+		exit 1
+	fi
+done
+
+if [[ "$(wc -c < "$BASE_FW")" -ne 8192 ]]; then
+	echo "Base fw_table must be exactly 8192 bytes: $BASE_FW" >&2
 	exit 1
 fi
 
-if [[ ! -f "$ROOT_DIR/$BASE_FW" ]]; then
-	echo "Base fw table not found: $ROOT_DIR/$BASE_FW" >&2
-	exit 1
-fi
+mkdir -p "$BUILD_DIR" "$FLASH_DIR"
+cp "$KERNEL_DIR/.config" "$BUILD_DIR/.config"
+"$KERNEL_DIR/scripts/config" \
+	--file "$BUILD_DIR/.config" \
+	--set-str INITRAMFS_SOURCE "$ROOT_DIR/initramfs"
 
-if [[ ! -f "$ROOT_DIR/$DTB_FILE" ]]; then
-	echo "DTB file not found: $ROOT_DIR/$DTB_FILE" >&2
-	exit 1
-fi
+echo "[1/5] Configuring Linux $KERNEL_VERSION"
+make -C "$KERNEL_DIR" O="$BUILD_DIR" ARCH="$ARCH" olddefconfig
 
-IMG_OUT="Image-6.18.2-${VERSION}-raw-padded"
-FW_OUT="fw_table_${VERSION}.bin"
+echo "[2/5] Building Image and DTBs"
+make -C "$KERNEL_DIR" O="$BUILD_DIR" ARCH="$ARCH" -j"$JOBS" \
+	KBUILD_BUILD_TIMESTAMP="@$SOURCE_DATE_EPOCH" \
+	KBUILD_BUILD_USER="$KBUILD_BUILD_USER" \
+	KBUILD_BUILD_HOST="$KBUILD_BUILD_HOST" \
+	Image dtbs
 
-echo "[1/3] Rebuilding kernel Image..."
-prepare_initramfs_mdadm
-(cd "$KERNEL_DIR" && ./scripts/kconfig/merge_config.sh .config "$ROOT_DIR/rtd1295_initramfs_fix.config" "$ROOT_DIR/rtd1295_cmdline_fix.config" "$ROOT_DIR/rtd1295_compat32.config" "$ROOT_DIR/rtd1295_mdraid.config" >/dev/null)
-make -C "$KERNEL_DIR" ARCH=arm64 -j"$(nproc)" Image
+RAW_IMAGE="$BUILD_DIR/arch/$ARCH/boot/Image"
+RAW_DTB="$BUILD_DIR/arch/$ARCH/boot/dts/realtek/rtd1295-wd-mycloud-home.dtb"
 
-echo "[2/3] Packaging artifacts..."
-read -r KERN_BLOCKS DTB_BLOCKS FW_CKSUM KERN_CKSUM DTB_CKSUM <<EOF
-$(python3 <<PYEOF
+echo "[3/5] Packaging Image, DTB, and fw_table"
+python3 - \
+	"$RAW_IMAGE" \
+	"$RAW_DTB" \
+	"$BASE_FW" \
+	"$FLASH_DIR/$IMAGE_NAME" \
+	"$FLASH_DIR/mch.dtb" \
+	"$FLASH_DIR/fw_table.bin" \
+	"$FLASH_DIR/BUILD-METADATA.json" \
+	"$KERNEL_VERSION" \
+	"$RELEASE_NAME" \
+	"$SOURCE_COMMIT" \
+	"$SOURCE_DATE_EPOCH" <<'PY'
+import hashlib
+import json
 import struct
+import sys
 from pathlib import Path
 
-root = Path("$ROOT_DIR")
-img_in = root / "linux-6.18.2/arch/arm64/boot/Image"
-img_out = root / "$IMG_OUT"
-fw_in = root / "$BASE_FW"
-fw_out = root / "$FW_OUT"
-dtb = root / "$DTB_FILE"
+(
+    raw_image_path,
+    raw_dtb_path,
+    base_fw_path,
+    image_path,
+    dtb_path,
+    fw_path,
+    metadata_path,
+    kernel_version,
+    release_name,
+    source_commit,
+    source_date_epoch,
+) = sys.argv[1:]
 
-kernel = bytearray(img_in.read_bytes())
-struct.pack_into('<Q', kernel, 8, 0x200000)
-struct.pack_into('<I', kernel, 0, 0x91005a4d)
-struct.pack_into('<I', kernel, 60, 0x40)
+raw_image = Path(raw_image_path).read_bytes()
+raw_dtb = Path(raw_dtb_path).read_bytes()
+fw = bytearray(Path(base_fw_path).read_bytes())
 
-kern_padded = (len(kernel) + 0xFFF) & ~0xFFF
-kernel.extend(b'\x00' * (kern_padded - len(kernel)))
-img_out.write_bytes(kernel)
-kern_cksum = sum(kernel) & 0xFFFFFFFF
+if len(raw_image) < 64:
+    raise SystemExit("raw Image is too small to contain an arm64 header")
+if struct.unpack_from("<I", raw_image, 56)[0] != 0x644D5241:
+    raise SystemExit("raw Image does not contain the arm64 Image magic")
+if len(raw_dtb) < 8 or struct.unpack_from(">I", raw_dtb, 0)[0] != 0xD00DFEED:
+    raise SystemExit("DTB does not contain the flattened-device-tree magic")
+if len(fw) != 8192:
+    raise SystemExit("base fw_table is not 8192 bytes")
 
-dtb_blob = bytearray(dtb.read_bytes())
-dtb_padded = len(dtb_blob)
-dtb_cksum = sum(dtb_blob) & 0xFFFFFFFF
+kernel = bytearray(raw_image)
+struct.pack_into("<I", kernel, 0, 0x91005A4D)
+struct.pack_into("<Q", kernel, 8, 0x200000)
+struct.pack_into("<I", kernel, 60, 0x40)
+kernel.extend(b"\0" * (-len(kernel) % 0x1000))
 
-fw = bytearray(fw_in.read_bytes())
-struct.pack_into('<I', fw, 0x1A0 + 14, dtb_padded)
-struct.pack_into('<I', fw, 0x1A0 + 18, dtb_padded)
-struct.pack_into('<I', fw, 0x1A0 + 22, dtb_cksum)
-struct.pack_into('<I', fw, 0x260 + 14, kern_padded)
-struct.pack_into('<I', fw, 0x260 + 18, kern_padded)
-struct.pack_into('<I', fw, 0x260 + 22, kern_cksum)
+dtb_size = 0x7000
+if len(raw_dtb) > dtb_size:
+    raise SystemExit(
+        f"DTB is {len(raw_dtb)} bytes, larger than the 0x{dtb_size:x}-byte slot"
+    )
+dtb = bytearray(raw_dtb)
+dtb.extend(b"\0" * (dtb_size - len(dtb)))
 
-fw_cksum = sum(fw[0x0A:]) & 0xFFFF
-struct.pack_into('<H', fw, 8, fw_cksum)
-fw_out.write_bytes(fw)
+kernel_checksum = sum(kernel) & 0xFFFFFFFF
+dtb_checksum = sum(dtb) & 0xFFFFFFFF
 
-print(kern_padded // 512, dtb_padded // 512, f"{fw_cksum:04x}", f"{kern_cksum:08x}", f"{dtb_cksum:08x}")
-PYEOF
+struct.pack_into("<III", fw, 0x1A0 + 14, len(dtb), len(dtb), dtb_checksum)
+struct.pack_into(
+    "<III", fw, 0x260 + 14, len(kernel), len(kernel), kernel_checksum
 )
+struct.pack_into("<H", fw, 8, sum(fw[0x0A:]) & 0xFFFF)
+
+Path(image_path).write_bytes(kernel)
+Path(dtb_path).write_bytes(dtb)
+Path(fw_path).write_bytes(fw)
+
+def sha256(blob: bytes) -> str:
+    return hashlib.sha256(blob).hexdigest()
+
+metadata = {
+    "package": f"wd-mch-kernel-{kernel_version}-{release_name}",
+    "kernel_version": kernel_version,
+    "release": release_name,
+    "source_commit": source_commit,
+    "source_date_epoch": int(source_date_epoch),
+    "image": {
+        "file": Path(image_path).name,
+        "raw_bytes": len(raw_image),
+        "padded_bytes": len(kernel),
+        "sata_blocks": len(kernel) // 512,
+        "additive_checksum": f"0x{kernel_checksum:08x}",
+        "sha256": sha256(kernel),
+    },
+    "dtb": {
+        "file": Path(dtb_path).name,
+        "raw_bytes": len(raw_dtb),
+        "padded_bytes": len(dtb),
+        "sata_blocks": len(dtb) // 512,
+        "additive_checksum": f"0x{dtb_checksum:08x}",
+        "sha256": sha256(dtb),
+    },
+    "fw_table": {
+        "file": Path(fw_path).name,
+        "bytes": len(fw),
+        "checksum": f"0x{struct.unpack_from('<H', fw, 8)[0]:04x}",
+        "sha256": sha256(fw),
+    },
+}
+Path(metadata_path).write_text(
+    json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+
+KERNEL_BYTES="$(wc -c < "$FLASH_DIR/$IMAGE_NAME")"
+DTB_BYTES="$(wc -c < "$FLASH_DIR/mch.dtb")"
+KERNEL_BLOCKS=$((KERNEL_BYTES / 512))
+DTB_BLOCKS=$((DTB_BYTES / 512))
+
+printf -v KERNEL_BLOCKS_HEX '0x%x' "$KERNEL_BLOCKS"
+printf -v DTB_BLOCKS_HEX '0x%x' "$DTB_BLOCKS"
+
+cat > "$FLASH_DIR/FLASH_COMMANDS.txt" <<EOF
+# Generated for $PACKAGE_NAME from source commit $SOURCE_COMMIT
+# Confirm every TFTP byte count before running the following sata write.
+
+sata init
+env set serverip 192.168.1.100
+env set ipaddr 192.168.1.200
+
+tftp 0x04000000 mch.dtb
+sata write 0x04000000 0x31000 $DTB_BLOCKS_HEX
+
+tftp 0x04000000 $IMAGE_NAME
+sata write 0x04000000 0x33800 $KERNEL_BLOCKS_HEX
+
+tftp 0x04000000 fw_table.bin
+sata write 0x04000000 0x22 0x10
+
+env set bootdelay 5
+bootr
 EOF
 
-echo "[3/3] Done"
-echo
-echo "=== Package Summary ==="
-echo "Kernel file : $IMG_OUT"
-echo "FW table    : $FW_OUT"
-echo "Kernel cksum: 0x$KERN_CKSUM"
-echo "DTB cksum   : 0x$DTB_CKSUM"
-echo "FW cksum    : 0x$FW_CKSUM"
-echo
-echo "=== Mac download to TFTP ==="
-echo "scp $SERVER:$ROOT_DIR/$FW_OUT ~/"
-echo "scp $SERVER:$ROOT_DIR/$IMG_OUT ~/"
-echo "sudo cp ~/$FW_OUT ~/$IMG_OUT /private/tftpboot/"
-echo
-echo "=== WD flash commands (1st stage) ==="
-echo "sata init"
-echo "env set serverip 192.168.123.191"
-echo "env set ipaddr 192.168.123.164"
-echo
-echo "tftp 0x04000000 $FW_OUT"
-echo "sata write 0x04000000 0x22 0x10"
-echo
-echo "tftp 0x04000000 $IMG_OUT"
-printf 'sata write 0x04000000 0x33800 0x%x\n' "$KERN_BLOCKS"
-echo
-echo "env set bootdelay 5"
-echo "bootr"
-echo
-echo "Then in 2nd stage: booti 0x03000000 - 0x01f00000"
+(
+	cd "$FLASH_DIR"
+	sha256sum "$IMAGE_NAME" mch.dtb fw_table.bin > SHA256SUMS
+	sha256sum -c SHA256SUMS
+)
+
+echo "[4/5] Verifying fw_table fields and padded artifacts"
+python3 - \
+	"$FLASH_DIR/$IMAGE_NAME" \
+	"$FLASH_DIR/mch.dtb" \
+	"$FLASH_DIR/fw_table.bin" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+image = Path(sys.argv[1]).read_bytes()
+dtb = Path(sys.argv[2]).read_bytes()
+fw = Path(sys.argv[3]).read_bytes()
+
+expected = {
+    "DTB stored size": (0x1A0 + 14, len(dtb)),
+    "DTB allocated size": (0x1A0 + 18, len(dtb)),
+    "DTB checksum": (0x1A0 + 22, sum(dtb) & 0xFFFFFFFF),
+    "Image stored size": (0x260 + 14, len(image)),
+    "Image allocated size": (0x260 + 18, len(image)),
+    "Image checksum": (0x260 + 22, sum(image) & 0xFFFFFFFF),
+}
+for label, (offset, value) in expected.items():
+    actual = struct.unpack_from("<I", fw, offset)[0]
+    if actual != value:
+        raise SystemExit(f"{label}: fw_table has {actual:#x}, expected {value:#x}")
+
+fw_checksum = struct.unpack_from("<H", fw, 8)[0]
+if fw_checksum != sum(fw[0x0A:]) & 0xFFFF:
+    raise SystemExit("fw_table checksum is invalid")
+if len(image) % 0x1000:
+    raise SystemExit("Image is not padded to a 4096-byte boundary")
+if len(dtb) != 0x7000:
+    raise SystemExit("DTB is not padded to exactly 0x7000 bytes")
+if struct.unpack_from("<I", image, 0)[0] != 0x91005A4D:
+    raise SystemExit("Image RTD1295 header magic is invalid")
+PY
+
+echo "[5/5] Creating deterministic archive"
+tar \
+	--sort=name \
+	--mtime="@$SOURCE_DATE_EPOCH" \
+	--owner=0 \
+	--group=0 \
+	--numeric-owner \
+	-czf "$ARCHIVE" \
+	-C "$(dirname "$OUTPUT_DIR")" \
+	"$(basename "$OUTPUT_DIR")"
+
+tar -tzf "$ARCHIVE" > "$BUILD_DIR/package-contents.txt"
+grep -Fqx "$PACKAGE_NAME/flash/$IMAGE_NAME" "$BUILD_DIR/package-contents.txt"
+
+cat <<EOF
+
+Package:        $PACKAGE_NAME
+Source commit:  $SOURCE_COMMIT
+Image bytes:    $KERNEL_BYTES ($KERNEL_BLOCKS_HEX SATA blocks)
+DTB bytes:      $DTB_BYTES ($DTB_BLOCKS_HEX SATA blocks)
+Package dir:    $OUTPUT_DIR
+Archive:        $ARCHIVE
+Flash commands: $FLASH_DIR/FLASH_COMMANDS.txt
+EOF

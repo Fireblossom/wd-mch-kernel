@@ -4,3 +4,4 @@ Image-*
 uImage*
 *.img
 nohup.out
+build/
