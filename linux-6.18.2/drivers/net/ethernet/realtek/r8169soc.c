@@ -8276,8 +8276,8 @@ rtl_init_one(struct platform_device *pdev)
 	struct proc_dir_entry *entry = NULL;
 #endif
 	#if defined(CONFIG_ARCH_RTD129x)
-	struct clk *clk_etn_sys  = clk_get(&pdev->dev, "etn_sys");
-	struct clk *clk_etn_250m = clk_get(&pdev->dev, "etn_250m");
+	struct clk *clk_etn_sys  = rtl_clk_get_optional(&pdev->dev, "etn_sys");
+	struct clk *clk_etn_250m = rtl_clk_get_optional(&pdev->dev, "etn_250m");
 	struct reset_control *rstc_gphy = reset_control_get_exclusive(&pdev->dev, "gphy");
 	struct reset_control *rstc_gmac = reset_control_get_exclusive(&pdev->dev, "gmac");
 	u32 rgmii_voltage = 1;
