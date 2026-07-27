@@ -279,11 +279,31 @@
 	status = "disabled";
 };
 
-/* v13: the four &cpuN spin-table blocks (v12) are removed again - mainline
- * spin-table hard-hangs 6.18 at smp bringup on this BL31 (release addr
- * 0x9801aa44 is device-register space; vendor semantics differ). Single
- * core until a proper rtk spin-table enable-method is ported.
+/* v17: spin-table restored. smp_spin_table.c now detects a non-memory
+ * release address and uses the vendor access pattern (plain ioremap +
+ * 32-bit writel + sev) instead of ioremap_cache + writeq + dcache
+ * maintenance, which hard-hung the interconnect (the v23 failure).
  */
+&cpu0 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x9801aa44>;
+};
+
+&cpu1 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x9801aa44>;
+};
+
+&cpu2 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x9801aa44>;
+};
+
+&cpu3 {
+	enable-method = "spin-table";
+	cpu-release-addr = <0x0 0x9801aa44>;
+};
+
 
 /*
  * Vendor 4.9 uses a Realtek-specific "rtk-spin-table" CPU bring-up path.

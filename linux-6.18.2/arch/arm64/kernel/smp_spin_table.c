@@ -11,6 +11,7 @@
 #include <linux/smp.h>
 #include <linux/types.h>
 #include <linux/mm.h>
+#include <linux/memblock.h>
 
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
@@ -70,6 +71,31 @@ static int smp_spin_table_cpu_prepare(unsigned int cpu)
 
 	if (!cpu_release_addr[cpu])
 		return -ENODEV;
+
+	/*
+	 * RTD1295 quirk: the release address (0x9801AA44) is an MMIO
+	 * register in the SoC block, not RAM. ioremap_cache() + a 64-bit
+	 * write + cache maintenance on that region hard-hangs the
+	 * interconnect (observed: silent lockup right before
+	 * "smp: Bringing up secondary CPUs"). The vendor 4.9 port uses a
+	 * plain device mapping with a 32-bit write - the register is 32
+	 * bits wide and with 1 GiB of RAM the pen address always fits.
+	 * Use that access pattern whenever the release address is not
+	 * plain memory.
+	 */
+	if (!memblock_is_map_memory(cpu_release_addr[cpu])) {
+		void __iomem *rel32 = ioremap(cpu_release_addr[cpu],
+					      sizeof(u32));
+
+		if (!rel32)
+			return -ENOMEM;
+
+		writel_relaxed((u32)pa_holding_pen, rel32);
+		dsb(sy);
+		sev();
+		iounmap(rel32);
+		return 0;
+	}
 
 	/*
 	 * The cpu-release-addr may or may not be inside the linear mapping.
