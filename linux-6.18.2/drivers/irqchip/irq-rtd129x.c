@@ -132,14 +132,11 @@ static void mux_irq_handle(struct irq_desc *desc)
 {
 	struct irq_mux_data *mux_data = irq_desc_get_handler_data(desc);
 	struct irq_chip *chip = irq_desc_get_chip(desc);
-	unsigned int irq = irq_desc_get_irq(desc);
 	unsigned int tmp;
-	int ret;
 	unsigned int mux_irq;
-	static u32 count;
 	u8 en_offset;
 	int i;
-	unsigned int status, check_status;
+	unsigned int status;
 	unsigned int enable;
 
 	u32 reg_st = mux_data->intr_status;
@@ -154,16 +151,14 @@ static void mux_irq_handle(struct irq_desc *desc)
 
 	for (i = 0 ; i < IRQ_INMUX ; i++) {
 		if (status & BIT(i)) {
-			/* Ack the mux status bit (write-1-to-clear) before
-			 * dispatching. The vendor tree relied on its forked
-			 * 8250 driver acking this register via the DT
-			 * interrupts-st-mask property; mainline peripheral
-			 * drivers know nothing about it, which turned every
-			 * UART interrupt into the noisy "status is not
-			 * change" fallback below - and each printed error
-			 * caused further TX interrupts, a self-sustaining
-			 * storm. Acking up-front is safe: the peripheral
-			 * keeps its own interrupt state (e.g. 8250 IIR).
+			/* Ack the mux status bit before dispatching. The
+			 * ISR latches peripheral interrupt edges (verified
+			 * on ISO_ISR bit2/UR0 by devmem: write-1-to-clear
+			 * with bit0 = WRITE_DATA per rtk_iso.h, stays clear
+			 * while the line is quiet). The vendor tree acked
+			 * from its forked 8250 driver via interrupts-st-mask;
+			 * mainline peripheral drivers know nothing about
+			 * this register, so the mux must ack here.
 			 */
 			spin_lock(&irq_mux_lock);
 			__raw_writel(BIT(i), mux_data->base + reg_st);
@@ -172,74 +167,24 @@ static void mux_irq_handle(struct irq_desc *desc)
 			en_offset = irq_map_tab[mux_data->index][i];
 			mux_irq = mux_data->irq_offset + i;
 
-			if ((en_offset < IRQ_INMUX) &&
-				(enable & BIT(en_offset))) {
-
+			/* NEVER printk in this handler: the console may
+			 * ride a muxed uart, so a print here generates a
+			 * fresh uart interrupt event and the handler
+			 * re-enters forever (the v29/v30 log storm). Any
+			 * event without a consumer (e.g. latched before the
+			 * peripheral driver probed) was already acked above -
+			 * drop it silently.
+			 */
+			if (((en_offset < IRQ_INMUX) &&
+			     (enable & BIT(en_offset))) ||
+			    (en_offset == MISC_INT_RVD)) {
 				tmp = irq_find_mapping(rtk_domain, mux_irq);
-				ret = generic_handle_irq(tmp);
-
-				if (ret != 0) {
-					pr_err("[%s] irq(%u) desc is not found"
-						"(st:0x%08x en:0x%08x)\n",
-						DEV_NAME,
-						mux_irq,
-						status,
-						enable);
-				}
-			} else if (en_offset == MISC_INT_RVD) {
-
-				tmp = irq_find_mapping(rtk_domain, mux_irq);
-				ret = generic_handle_irq(tmp);
-
-				if (ret != 0) {
-					pr_err("[%s] irq(%u) desc is not found"
-						"(st:0x%08x en:0x%08x)\n",
-						DEV_NAME,
-						mux_irq,
-						status,
-						enable);
-				}
-			} else {
-				pr_err("[%s] irq(%u) should not happen"
-					"(st:0x%08x en:0x%08x)\n",
-					DEV_NAME,
-					mux_irq,
-					status,
-					enable);
+				if (tmp)
+					generic_handle_irq(tmp);
 			}
 		}
 	}
 
-	/* as a transmission interface, SPI wont do too much here */
-	if (irq == 1 && status | 0x08000000)
-		goto out;
-
-
-	spin_lock(&irq_mux_lock);
-	check_status = __raw_readl(mux_data->base + reg_st);
-	spin_unlock(&irq_mux_lock);
-
-	if (check_status == status) {
-		if (count > 1) {
-			pr_err("[%s] (%u) %s irq status is not change"
-				"clear it! (st:0x%08x en:0x%08x)\n",
-				DEV_NAME,
-				irq,
-				mux_data->index ? "ISO" : "MISC",
-				status,
-				enable);
-		} else {
-			count++;
-		}
-
-		spin_lock(&irq_mux_lock);
-		__raw_writel(BIT(__ffs(status)), mux_data->base + reg_st);
-		spin_unlock(&irq_mux_lock);
-
-	} else {
-		count = 0;
-	}
-out:
 	chained_irq_exit(chip, desc);
 }
 

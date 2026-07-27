@@ -79,15 +79,14 @@
 	 */
 	mux_intc: interrupt-controller@1b000 {
 		compatible = "Realtek,rtk-irq-mux";
-		/* v16: disabled for now. With the node enabled, ISO_ISR bit2 reads
-		 * as 1 from power-on and W1C does not clear it, so the chained
-		 * handler on GIC SPI 41 spins in the "status is not change" path
-		 * (~4 log lines/s, self-sustaining via console TX). Needs devmem
-		 * poking of 0x98007000 ISR semantics on a live system before the
-		 * uart can move off polling. Everything below is the full vendor
-		 * contract and is known-good otherwise (ttyS0 got virq 34).
+		/* v18: enabled. The earlier "stuck ISO_ISR bit2" was a probe
+		 * artifact - the register is a normal W1C event latch (bit0 =
+		 * WRITE_DATA convention, see vendor rtk_iso.h), but every probe
+		 * command itself generated uart traffic that re-latched the bit.
+		 * The real storm cause was printk inside the mux handler feeding
+		 * the console uart; the driver is silent now.
 		 */
-		status = "disabled";
+		status = "okay";
 		interrupt-controller;
 		#interrupt-cells = <2>;
 
@@ -265,9 +264,13 @@
 };
 
 &uart0 {
-	/* v16: polled (no interrupt wiring) while mux_intc is disabled -
-	 * dw8250 ENXIO fallback, the console mode every working boot used.
+	/* v18: IRQ via ISO mux (index 1, status bit 2). interrupts-st-mask
+	 * matches the vendor DT; mainline 8250 ignores it (the mux driver
+	 * acks the latch instead).
 	 */
+	interrupt-parent = <&mux_intc>;
+	interrupts = <1 2>;
+	interrupts-st-mask = <0x4>;
 	status = "okay";
 };
 
