@@ -35,7 +35,7 @@ If you want to use the prebuilt kernel:
 
 If you plan to modify or port the kernel, start with `linux-6.18.2/`, the
 [Building from source](#building-from-source) section, and
-[`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md) (Chinese). The other
+[`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md). The other
 top-level notes document earlier investigation and may contain conclusions that
 were later superseded; they should not be treated as current instructions.
 
@@ -80,7 +80,7 @@ fw_table.bin
 
 These files form one validated set and must be used together. For a concise
 explanation of the internal milestones, see
-[`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md) (Chinese).
+[`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md).
 
 ## Verified functionality
 

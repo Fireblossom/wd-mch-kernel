@@ -1,41 +1,127 @@
-# 开发版本沿革
+# Development History
 
-本文解释移植过程中出现的 `v21`、`v38`、`v46` 等内部编号。它面向维护者和审计者，
-不是供普通用户选择的版本清单。
+This page explains how the WD My Cloud Home port became usable. It is a
+maintainer-oriented history, not a list of releases for users to choose from.
 
-当前对外发行版是 **r1**。使用现成刷机包时，应当把
-`Image-6.18.2-mch`、`mch.dtb` 和 `fw_table.bin` 作为一个整体，不要从下面的历史
-组合中拆文件混用。
+If you only want to install the kernel, use the current **r1** package and
+follow its flashing guide. The `v21`, `v38`, and similar names below were
+temporary labels used during hardware testing.
 
-## 编号规则
+## The short version
 
-每个 `vNN` 表示当时用于真机测试的一套集成组合，通常同时涉及：
+Development progressed in four broad stages:
 
-- 经过设备兼容头修补和填充的内核 Image；
-- 一份特定迭代的 DTB；
-- 记录 Image/DTB 长度和校验和的 `fw_table`。
+1. Boot the existing Debian installation from its `/dev/md1` RAID device.
+2. Bring up all CPU cores, interrupts, the serial console, and Ethernet.
+3. Add the kernel features and hardware support needed for normal NAS use.
+4. Add safer slot selection, rollback options, and network recovery.
 
-`vNN` 只表达开发先后顺序。跳号通常是短期探针或失败的中间构建。它不是 Git tag，
-也不是对外发行版。内核启动日志中的 `#NN` 是另一套本地编译计数；DTB 也曾有自己的
-`vNN` 迭代号，三者不能按数字配对。
+The first public package, **r1**, was produced after those stages were
+completed. It is based on the final `v46` development combination.
 
-## 主要里程碑
+## 1. Booting the existing Debian system
 
-| 内部组合 | 当时首次解决的问题 | 现在的意义 |
+The first challenge was not simply starting the kernel. The initramfs also had
+to assemble the device's Linux MD array before it could mount the Debian root
+filesystem.
+
+- **v21:** Added `mdadm` to the initramfs. The kernel could find and assemble
+  the RAID device containing the Debian root filesystem, but the system was not
+  yet suitable for normal use.
+- **v27:** Reached a complete systemd boot. The serial login service was still
+  disabled, so this was an important diagnostic milestone rather than a usable
+  recovery environment.
+- **v31:** Reached a repeatable boot with an interactive shell on the serial
+  console. At this point the system still used only one CPU core, and the UART
+  relied on polling instead of hardware interrupts.
+
+## 2. Enabling the SoC hardware
+
+Once the basic boot path worked, the focus moved to the Realtek RTD1295
+hardware that was not supported by the upstream kernel configuration.
+
+- **v32:** Corrected access to the CPU release address and brought all four
+  Cortex-A53 cores online.
+- **v34:** Added the RTD129x interrupt multiplexer and converted the serial
+  port from polling to normal interrupt-driven operation.
+- **v36:** Enabled the integrated Gigabit Ethernet controller and preserved the
+  factory-assigned MAC address.
+
+These changes turned the early single-core diagnostic system into a practical
+networked machine.
+
+## 3. Making the system useful as a NAS
+
+The next stage added the kernel facilities expected by Debian, containers, and
+NAS software.
+
+- **v38:** Enabled NFS, ACLs, quotas, TUN, WireGuard, device-mapper encryption,
+  FUSE, and zram. It also added a working soft-reboot path.
+- **v42:** Enabled the rear USB 3.0 port at 5 Gbit/s and added SoC temperature
+  monitoring and an RTC device-tree node. This was the first combination with
+  the hardware and operating-system features needed for routine use.
+
+The RTC node allows the driver to register, but the clock still does not
+advance correctly. The released system therefore relies on NTP for wall-clock
+time.
+
+## 4. Adding recovery and preparing the release
+
+- **v46:** Added explicit B/A/GOLD slot selection and a one-shot network
+  recovery environment. This combination became the technical basis of the
+  public **r1** package.
+
+The recovery work was deliberately completed before publication. The
+bootloader does not automatically roll back a failed boot, so preserving the A
+and GOLD slots remains essential.
+
+## Milestone reference
+
+The table below is for source-history lookup. These identifiers are not
+downloadable releases.
+
+| Internal label | Milestone | Related commit |
 |---|---|---|
-| `v21` | initramfs 加入 mdadm，能够识别 Debian 的 md 根文件系统 | 早期启动实验，功能不完整 |
-| `v27` | systemd 能完整进入 graphical.target | 串口 getty 当时仍被 mask |
-| `v31` | 可以稳定启动并从串口登录 | 单核、UART 轮询的早期稳态；对应 Git 基线 `29a312b28` |
-| `v32` | 修正 CPU release-address 访问，四个 Cortex-A53 核心上线 | SMP 里程碑，提交 `776e6569b` |
-| `v34` | RTD129x interrupt mux 和 UART 真中断稳定工作 | UART 里程碑，提交 `34adcdfb4` |
-| `v36` | 板载千兆以太网工作，并读取出厂 MAC | 网络里程碑，提交 `ea27e1acc` |
-| `v38` | 加入 NFS/ACL/配额、TUN/WireGuard、dm-crypt、FUSE、zram，并实现软重启 | NAS 功能里程碑，提交 `4cda483ae` |
-| `v42` | USB 3.0 以 5 Gbit/s 工作，加入温度驱动和 RTC 节点，完成安全收尾 | 完整日常功能里程碑，提交 `4a3860a93` |
-| `v46` | 加入 A/B/GOLD 槽位控制和一次性网络救援 | **r1 的直接技术基础**，提交 `7b70fa890` |
+| `v21` | The initramfs could assemble the Debian MD root device | — |
+| `v27` | systemd completed its boot sequence | — |
+| `v31` | Repeatable boot with an interactive serial console | `29a312b28` |
+| `v32` | All four Cortex-A53 cores came online | `776e6569b` |
+| `v34` | Interrupt-driven UART operation became stable | `34adcdfb4` |
+| `v36` | Integrated Ethernet and the factory MAC address worked | `ea27e1acc` |
+| `v38` | NAS, container, VPN, storage, and soft-reboot support was added | `4cda483ae` |
+| `v42` | USB 3.0, temperature monitoring, and the RTC node were added | `4a3860a93` |
+| `v46` | Slot control and one-shot network recovery were added | `7b70fa890` |
 
-开发期间的“回滚链”只是实验现场保留的若干已知检查点，并不意味着这些旧组合都适合
-第三方日常使用。对外提供 `r1` 后，普通用户的回滚路径是刷前备份、保留的 A 槽和
-GOLD 救援槽，而不是自行拼装旧 `vNN` 文件。
+## What the internal numbers mean
 
-更细的故障现象、探针和验证记录保留在仓库历史文档中。阅读时应以提交时间和本表的
-里程碑为上下文；旧文档中的“当前”“下一步”等字样只代表当时状态。
+Each `vNN` label identified a kernel Image, device tree, and `fw_table` that
+were tested together on the device. The number only records the order of the
+experiments:
+
+- It is not a Git tag or a semantic version.
+- Missing numbers were usually short-lived diagnostic or failed builds.
+- A kernel build number such as `#35` is a separate compiler-generated
+  counter.
+- Device-tree files had another independent revision counter.
+
+For example, the `v46` test combination used device-tree revision `v22`. The
+different numbers do not indicate that an artifact is missing.
+
+## Relationship to the r1 package
+
+The public package replaces the internal labels with these filenames:
+
+```text
+Image-6.18.2-mch
+mch.dtb
+fw_table.bin
+```
+
+They form one validated set. The `fw_table` records the sizes and checksums of
+the kernel and device tree, so files from different development combinations
+must not be mixed.
+
+Old notes may use words such as “current” or “next” to describe the state of
+the project at the time they were written. Use the commit date and the
+milestones above when reading them; those notes are not current installation
+instructions.
