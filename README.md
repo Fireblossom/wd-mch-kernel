@@ -1,9 +1,10 @@
 # WD My Cloud Home (RTD1295) 主线内核移植
 
 把 WD My Cloud Home（Realtek RTD1295）从厂商 Android/4.9 内核迁移到主线
-Linux 6.18.2 + Debian 13。**2026-07-27 起设备可用**：B 槽跑自建内核，**四核 SMP（v32 起）+
-UART 真中断（v34 起）**，Debian 13 trixie 约 34 秒进 graphical.target，
-串口 **root autologin** 直接进 shell。剩余大项只有以太网（见「遗留项」）。
+Linux 6.18.2 + Debian 13。**2026-07-27 达成完全体**：B 槽自建内核，**四核 SMP（v32）+ UART 真中断
+（v34）+ 千兆以太网（v36）**，Debian 13 trixie 约 34 秒进 graphical.target，
+断电重启后网络/SSH 无人值守自动恢复。访问：`ssh root@192.168.123.164`
+（Mac 公钥已装）或串口 root autologin。
 
 **总日志（最详细、含全部根因和踩坑）在 Mac 上：`~/.wd-debug/WORKLOG.md`。**
 本 README 只负责让新会话/新人在这个仓库里快速定位。
@@ -61,12 +62,12 @@ B 槽地址：FW_TABLE `0x22/0x10`、FDT_B `0x31000/0x38`、KERNEL_B `0x33800/�
 
 | 件 | 版本 | 校验和 |
 |---|---|---|
-| 内核 | #23（v34：+ mux handler 静默化）cksum 0x3fde8232 | ✅ 实机验证 |
-| DTB | v18（spin-table ×4 + mux okay + uart0 挂 ISO mux <1 2>）cksum 0x000484fd | ✅ |
-| fw_table | v34 | ✅ |
+| 内核 | #25（v36：+ r8169soc 以太网）| ✅ 实机验证 |
+| DTB | v18（spin-table ×4 + mux okay + uart0 ISO mux + gmac）cksum 0x000484fd | ✅ |
+| fw_table | v36 | ✅ |
 
-实测：ttyS0 at irq 34（RTK_IRQ_MUX 分发，/proc/interrupts 正常计数）、
-`smp: Brought up 1 node, 4 CPUs`、零风暴、autologin root shell。
+实测：4 CPU、ttyS0 irq 34、eth0 RTL8169SOC（出厂 MAC、link up、DHCP、
+ping/SSH 通）、断电重启无人值守全恢复。
 
 回滚链：v31（#20+v16，稳态可登录）→ v27（#19+v14）→ v21（#15+v11，4 月老稳态）。
 产物都在 Mac `~/.wd-debug/tftp/`。
@@ -78,7 +79,13 @@ B 槽地址：FW_TABLE `0x22/0x10`、FDT_B `0x31000/0x38`、KERNEL_B `0x33800/�
    ISO_ISR 是正常 W1C 事件锁存（bit0=WRITE_DATA，见厂商 rtk_iso.h），但 devmem
    命令本身的串口流量会重新置位；真凶是 mux handler 里的 printk 在 console 串口上
    自我喂养。教训：**console 所在总线的中断处理器里永远不要 printk**
-3. 以太网无驱动：厂商 GMAC 在 GPL 包 `drivers/net/ethernet/realtek/`，或 USB 网卡过渡
-4. Debian 侧：串口已配 **root autologin**（`/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf`，
-   拿到串口线即 root——调试期便利，收尾时删掉该文件并 `passwd` 设口令）；
-   serial-getty 的 /dev/null mask 已由 initramfs fixup 自动解除
+3. ✅ ~~以太网~~ —— v36 修复（git 28b3337）：厂商 r8169soc 移植 + 两处漏改的裸
+   clk_get 修掉 + NET_VENDOR_REALTEK 的 PCI 门放宽。⚠️ 同类教训第三次出现：
+   **驱动移植完成 ≠ 能被选上——每次都要查 Kconfig 依赖链能否成立**
+4. Debian 侧修复记录：`/usr/sbin` 里 71 个 2011 年 BusyBox 化石（WD 固件残渣，
+   遮蔽 run-parts 等致 networking.service 必败）已隔离到
+   `/root/vendor-busybox-quarantine/`；serial-getty mask 由 initramfs fixup 解除；
+   串口 root autologin + Mac 公钥 SSH 均已配置（调试期结束后：删 autologin
+   drop-in、`passwd`、评估 quarantine 目录去留）
+5. 小项：r8169soc 的 rtl_csiar_cond 超时告警（无碍功能）；iputils ping 曾报
+   clock_gettime 错（化石清理后待复验）
