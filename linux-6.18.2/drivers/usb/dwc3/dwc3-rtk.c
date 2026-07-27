@@ -378,10 +378,27 @@ static int dwc3_rtk_probe(struct platform_device *pdev)
 	 */
 	if (of_device_is_compatible(dev->of_node, "realtek,rtd1295-dwc3")) {
 		void __iomem *clk_en1 = ioremap(0x9800000c, 0x4);
+		void __iomem *typec_cc1 = ioremap(0x9801334c, 0x4);
 
 		if (clk_en1) {
 			writel(readl(clk_en1) | BIT(4), clk_en1);
 			iounmap(clk_en1);
+		}
+
+		/* Route the SuperSpeed lanes: the type-c lane switch resets
+		 * to "disconnected" and the physical port on this board is a
+		 * fixed type-A, so pin it to the CC1 orientation (BIT(29)
+		 * enable, BIT(28)|BIT(27) TxRx-sel clear). Without this the
+		 * port links at High-Speed only. Idempotent across the three
+		 * wrapper instances.
+		 */
+		if (typec_cc1) {
+			u32 v = readl(typec_cc1);
+
+			v &= ~(BIT(29) | BIT(28) | BIT(27));
+			v |= BIT(29);
+			writel(v, typec_cc1);
+			iounmap(typec_cc1);
 		}
 	}
 

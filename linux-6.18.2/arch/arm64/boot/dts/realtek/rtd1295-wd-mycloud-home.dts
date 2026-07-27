@@ -271,6 +271,13 @@
 		#phy-cells = <0>;
 	};
 
+	/* v42: on-die thermal sensor (scpu_wrapper block) */
+	soc_thermal: thermal-sensor@1d150 {
+		compatible = "realtek,rtd129x-thermal-sensor";
+		reg = <0x1d150 0x20>;
+		#thermal-sensor-cells = <0>;
+	};
+
 	usb2phy_drd: usb-phy@13214 {
 		compatible = "realtek,rtd1295-usb2phy";
 		reg = <0x13214 0x4>, <0x28280 0x4>;
@@ -478,3 +485,30 @@
 /* TODO: Port thermal zones
  * - thermal-zones
  */
+
+/ {
+	thermal-zones {
+		soc-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <10000>;
+			thermal-sensors = <&soc_thermal>;
+
+			trips {
+				soc-crit {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+	};
+};
+
+&iso {
+	rtc@600 {
+		compatible = "realtek,rtd1295-rtc";
+		reg = <0x600 0x34>;
+		clocks = <&osc27M>;
+		status = "okay";
+	};
+};
