@@ -371,6 +371,20 @@ static int dwc3_rtk_probe(struct platform_device *pdev)
 	if (IS_ERR(regs))
 		return PTR_ERR(regs);
 
+	/* RTD1295: no mainline clock driver exists for the CRT gates and the
+	 * bootloader leaves clk_en_usb (CRT 0x0c bit 4) closed, so every dwc3
+	 * register read returns garbage ("this is not a DesignWare USB3 DRD
+	 * Core"). Open the gate here until a proper clk driver exists.
+	 */
+	if (of_device_is_compatible(dev->of_node, "realtek,rtd1295-dwc3")) {
+		void __iomem *clk_en1 = ioremap(0x9800000c, 0x4);
+
+		if (clk_en1) {
+			writel(readl(clk_en1) | BIT(4), clk_en1);
+			iounmap(clk_en1);
+		}
+	}
+
 	rtk->regs = regs;
 	rtk->regs_size = resource_size(res);
 

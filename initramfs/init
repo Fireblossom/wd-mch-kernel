@@ -203,6 +203,21 @@ echo o > /proc/sysrq-trigger
 EOF
 chmod 755 /bin/poweroff-now
 
+# v19 USB helpers: the kernel has no RTD129x clk driver and no gpio wired
+# for VBUS, so open the USB clock gate (CRT 0x0c bit4) and drive the port
+# power gpio (misc-gpio 19: dir @0x9801b100, out @0x9801b110) here. xhci is
+# hotplug-capable, late VBUS is fine.
+enable_usb_power() {
+  v=$(/bin/busybox devmem 0x9800000c) &&
+    /bin/busybox devmem 0x9800000c 32 $((v | 0x10))
+  v=$(/bin/busybox devmem 0x9801b100) &&
+    /bin/busybox devmem 0x9801b100 32 $((v | 0x80000))
+  v=$(/bin/busybox devmem 0x9801b110) &&
+    /bin/busybox devmem 0x9801b110 32 $((v | 0x80000))
+  echo "[initramfs] usb: clk gate opened, vbus gpio19 driven high"
+}
+enable_usb_power
+
 echo "[initramfs] booted. kernel cmdline: $(cat /proc/cmdline)"
 echo "[initramfs] quick reboot: reboot -f  or  reboot-now"
 echo "[initramfs] block devices:"
