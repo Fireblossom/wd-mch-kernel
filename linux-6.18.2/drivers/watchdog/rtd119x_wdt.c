@@ -76,12 +76,29 @@ static int rtd119x_wdt_set_timeout(struct watchdog_device *wdev, unsigned int va
 	return 0;
 }
 
+static int rtd119x_wdt_restart(struct watchdog_device *wdev,
+			       unsigned long action, void *data_)
+{
+	struct rtd119x_watchdog_device *data = watchdog_get_drvdata(wdev);
+
+	/* Overflow after ~1 ms: TCWOV counts clock cycles (27 MHz osc). */
+	writel(clk_get_rate(data->clk) / 1000, data->base + RTD119X_TCWOV);
+	writel_relaxed(RTD119X_TCWTR_WDCLR, data->base + RTD119X_TCWTR);
+	rtd119x_wdt_start(wdev);
+
+	while (1)
+		cpu_relax();
+
+	return 0;
+}
+
 static const struct watchdog_ops rtd119x_wdt_ops = {
 	.owner = THIS_MODULE,
 	.start		= rtd119x_wdt_start,
 	.stop		= rtd119x_wdt_stop,
 	.ping		= rtd119x_wdt_ping,
 	.set_timeout	= rtd119x_wdt_set_timeout,
+	.restart	= rtd119x_wdt_restart,
 };
 
 static const struct watchdog_info rtd119x_wdt_info = {
@@ -119,6 +136,10 @@ static int rtd119x_wdt_probe(struct platform_device *pdev)
 	data->wdt_dev.parent = dev;
 
 	watchdog_stop_on_reboot(&data->wdt_dev);
+	/* No PSCI SYSTEM_RESET on this firmware; the watchdog is the only
+	 * working SoC reset. High priority so it wins over any default.
+	 */
+	watchdog_set_restart_priority(&data->wdt_dev, 192);
 	watchdog_set_drvdata(&data->wdt_dev, data);
 	platform_set_drvdata(pdev, data);
 
