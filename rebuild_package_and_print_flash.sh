@@ -88,6 +88,16 @@ SOURCE_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT_DIR" show -s --format=%ct HEAD)}"
 KBUILD_BUILD_USER="${KBUILD_BUILD_USER:-Fireblossom}"
 KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST:-wd-mch-builder}"
+SOURCE_CONFIG_BACKUP=""
+
+restore_source_config() {
+	if [[ -n "$SOURCE_CONFIG_BACKUP" && -f "$SOURCE_CONFIG_BACKUP" ]]; then
+		cp "$SOURCE_CONFIG_BACKUP" "$KERNEL_DIR/.config"
+		rm -f "$SOURCE_CONFIG_BACKUP"
+	fi
+}
+
+trap restore_source_config EXIT
 
 for required in \
 	"$KERNEL_DIR/Makefile" \
@@ -112,7 +122,16 @@ if [[ "$(wc -c < "$BASE_FW")" -ne 8192 ]]; then
 fi
 
 mkdir -p "$BUILD_DIR" "$FLASH_DIR"
-cp "$KERNEL_DIR/.config" "$BUILD_DIR/.config"
+SOURCE_CONFIG_BACKUP="$(mktemp)"
+cp "$KERNEL_DIR/.config" "$SOURCE_CONFIG_BACKUP"
+cp "$SOURCE_CONFIG_BACKUP" "$BUILD_DIR/.config"
+
+# Linux refuses an O= build when an earlier in-tree build left .config or
+# generated headers in the source directory. Keep the repository's tracked
+# configuration safe while mrproper removes only those build products.
+echo "[0/5] Cleaning in-tree build products"
+make -C "$KERNEL_DIR" ARCH="$ARCH" mrproper
+
 "$KERNEL_DIR/scripts/config" \
 	--file "$BUILD_DIR/.config" \
 	--set-str INITRAMFS_SOURCE "$ROOT_DIR/initramfs"
@@ -326,6 +345,9 @@ tar \
 
 tar -tzf "$ARCHIVE" > "$BUILD_DIR/package-contents.txt"
 grep -Fqx "$PACKAGE_NAME/flash/$IMAGE_NAME" "$BUILD_DIR/package-contents.txt"
+
+restore_source_config
+trap - EXIT
 
 cat <<EOF
 
