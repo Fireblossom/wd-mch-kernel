@@ -192,6 +192,11 @@ if struct.unpack_from("<I", raw_image, 56)[0] != 0x644D5241:
     raise SystemExit("raw Image does not contain the arm64 Image magic")
 if len(raw_dtb) < 8 or struct.unpack_from(">I", raw_dtb, 0)[0] != 0xD00DFEED:
     raise SystemExit("DTB does not contain the flattened-device-tree magic")
+raw_fdt_totalsize = struct.unpack_from(">I", raw_dtb, 4)[0]
+if raw_fdt_totalsize > len(raw_dtb):
+    raise SystemExit(
+        f"DTB header totalsize is {raw_fdt_totalsize}, larger than the file"
+    )
 if len(fw) != 8192:
     raise SystemExit("base fw_table is not 8192 bytes")
 
@@ -208,6 +213,10 @@ if len(raw_dtb) > dtb_size:
     )
 dtb = bytearray(raw_dtb)
 dtb.extend(b"\0" * (dtb_size - len(dtb)))
+# U-Boot/libfdt uses the big-endian totalsize field, not the host file size,
+# to decide how much room is available for /chosen and other runtime edits.
+# Claim the whole 0x7000-byte buffer so the zero padding is usable FDT space.
+struct.pack_into(">I", dtb, 4, dtb_size)
 
 kernel_checksum = sum(kernel) & 0xFFFFFFFF
 dtb_checksum = sum(dtb) & 0xFFFFFFFF
@@ -242,7 +251,9 @@ metadata = {
     "dtb": {
         "file": Path(dtb_path).name,
         "raw_bytes": len(raw_dtb),
+        "raw_fdt_totalsize": raw_fdt_totalsize,
         "padded_bytes": len(dtb),
+        "padded_fdt_totalsize": struct.unpack_from(">I", dtb, 4)[0],
         "sata_blocks": len(dtb) // 512,
         "additive_checksum": f"0x{dtb_checksum:08x}",
         "sha256": sha256(dtb),
@@ -328,9 +339,17 @@ if len(image) % 0x1000:
     raise SystemExit("Image is not padded to a 4096-byte boundary")
 if len(dtb) != 0x7000:
     raise SystemExit("DTB is not padded to exactly 0x7000 bytes")
+if struct.unpack_from(">I", dtb, 4)[0] != len(dtb):
+    raise SystemExit("DTB FDT totalsize does not expose the padded runtime space")
 if struct.unpack_from("<I", image, 0)[0] != 0x91005A4D:
     raise SystemExit("Image RTD1295 header magic is invalid")
 PY
+
+"$BUILD_DIR/scripts/dtc/dtc" \
+	-I dtb \
+	-O dts \
+	-o /dev/null \
+	"$FLASH_DIR/mch.dtb"
 
 echo "[5/5] Creating deterministic archive"
 tar \
