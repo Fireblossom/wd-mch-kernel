@@ -43,11 +43,16 @@ labelled
 [`r2-rc1` candidate](release/wd-mch-kernel-6.18.40-r2-rc1/README.md)
 and its generated flash commands. Do not mix files from the two packages.
 
-If you plan to modify or port the kernel, start with `linux-6.18.40/`, the
+If you plan to modify or port the kernel, start with
+[`docs/PORTING_GUIDE_4.9_to_6.18.md`](docs/PORTING_GUIDE_4.9_to_6.18.md)
+(Chinese) — a per-file account of every source change relative to vanilla
+6.18.40, the vendor boot chain, and the symptom-to-root-cause history of the
+port. Then see `linux-6.18.40/`, the
 [Building from source](#building-from-source) section, and
 [`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md). The other
 top-level notes document earlier investigation and may contain conclusions that
-were later superseded; they should not be treated as current instructions.
+were later superseded; the porting guide states which ones it replaces, and
+they should not be treated as current instructions.
 
 ## Recommended release
 
