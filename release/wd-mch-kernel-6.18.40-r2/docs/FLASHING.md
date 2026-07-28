@@ -9,8 +9,7 @@
 
 - 115200 8N1 TTL 串口；
 - 能进入一阶段 `Realtek>` U-Boot 提示符；
-- 可用的 A 槽或 GOLD 救援路径；
-- 当前固件表、B 槽 DTB 和 B 槽内核的备份；
+- **当前固件表、B 槽 DTB 和 B 槽内核的备份（这是唯一推荐的回退手段，不是可选项）；**
 - TFTP 服务器。
 
 在当前 Debian 系统中备份：
@@ -83,6 +82,11 @@ systemctl --failed
 
 ## 回滚
 
-如果内核能启动但 Debian 无法挂载，使用 netrescue。如果内核本身无法启动，在
-U-Boot 中使用 `snboot` 启动 A 槽或 `sgboot` 启动 GOLD。也可以按原扇区位置写回
-第 0 步保存的三个 B 槽备份。详细说明见 [`RESCUE.md`](RESCUE.md)。
+如果内核能启动但 Debian 无法挂载，使用 netrescue。
+
+如果内核本身无法启动，**按原扇区位置写回第 0 步保存的三个 B 槽备份**。
+
+> [!CAUTION]
+> 不要用 `sgboot` 启动 GOLD——它是出厂重置固件，每次启动都会无条件格式化数据
+> 分区并对 SSD 下发 TRIM。`snboot` 启动的 A 槽在社区 Debian 布局下通常也会
+> panic 循环。理由和实测细节见 [`RESCUE.md`](RESCUE.md)。

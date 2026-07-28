@@ -21,7 +21,8 @@ and other RTD1295-based products are outside the tested scope.
 > Writing the wrong disk sectors can make the device unbootable. Before
 > flashing, connect a 115200 8N1 serial console, back up the existing
 > partitions, and verify every address and transfer size. This project only
-> writes the B slot. Do not overwrite the A or GOLD recovery slots.
+> writes the B slot. Do not overwrite the A or GOLD slots — but do not treat
+> them as recovery paths either; see the rollback section below.
 
 ## Quick start
 
@@ -145,8 +146,17 @@ The release writes only these B-slot locations:
 
 Use the exact commands, backup procedure, and transfer-size checks in
 [`FLASHING.md`](release/wd-mch-kernel-6.18.40-r2/docs/FLASHING.md). Never
-overwrite the A or GOLD slots; they provide independent recovery paths if the
-mainline kernel cannot boot.
+overwrite the A or GOLD slots.
+
+> [!CAUTION]
+> Neither A nor GOLD is a usable fallback, despite what earlier notes in this
+> repository claimed. GOLD is an Android recovery image whose userspace runs an
+> unconditional factory reset on **every** boot, including `mke2fs -E discard`
+> on what the community Debian layout uses as the data partition; that TRIMs the
+> SSD and the data is gone immediately. Slot A, on a device installed by the
+> community Debian package, panic-loops on `switch_root`. **Back up the three
+> B-slot partitions before flashing and restore those if you need to roll back.**
+> Keep `bootConfig` at `0:F:0:;`.
 
 The first-stage bootloader does not decrement a retry counter and does not
 automatically roll back a failed slot. See
