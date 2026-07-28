@@ -1,311 +1,316 @@
-# 从厂商 Linux 4.9.330 移植到主线 Linux 6.18.40
+# Porting the WD My Cloud Home from vendor Linux 4.9.330 to mainline 6.18.40
 
-**目标设备**：WD My Cloud Home（单盘型号，Realtek RTD1295 "Monarch"/"Kamino" 平台，ARM Cortex-A53 ×4，1 GiB DRAM）
+**Target**: WD My Cloud Home, single-bay model — Realtek RTD1295 ("Monarch"/"Kamino" platform), 4× Cortex-A53, 1 GiB DRAM, one SATA SSD.
 
-**成果**：主线 6.18.40 内核在真机运行完整 Debian 13 + OpenMediaVault 8，四核 SMP、串口中断、千兆网、USB3、温度传感、软重启、NFS/SMB、Docker 全部可用。
+**Result**: mainline 6.18.40 running a full Debian 13 + OpenMediaVault 8 on real hardware, with 4-core SMP, interrupt-driven serial, gigabit ethernet, USB 3 SuperSpeed, a thermal sensor, working soft reboot, NFS/SMB and Docker.
 
-本文是**移植过程的技术说明**：每一处源码改动为什么必要、怎么定位、改了什么。它不是刷机说明（见 [README.md](README.md) 与 [docs/FLASHING.md](docs/FLASHING.md)），也不是版本编年史（见 [DEVELOPMENT_HISTORY.md](DEVELOPMENT_HISTORY.md)）。
+This document explains **the port itself**: what each source change does, why it was necessary, and how the problem was diagnosed. It is not a flashing manual (see [README.md](../README.md) and the release [`FLASHING.md`](../release/wd-mch-kernel-6.18.2-r1/docs/FLASHING.md)), and not a version chronology (see [`DEVELOPMENT_HISTORY.md`](../DEVELOPMENT_HISTORY.md)).
 
 ---
 
-## 0. 先读这一节：这个移植的性质
+## 0. Read this first: what kind of port this is
 
-主线内核对 RTD1295 的支持**比想象的完整得多**。移植工作的实际分布大致是：
+Mainline support for the RTD1295 is **far more complete than it first appears**. The actual distribution of work was roughly:
 
-| 类别 | 占比 | 说明 |
+| Category | Share | Notes |
 |---|---|---|
-| 让已存在的主线驱动能被选中 | 最大 | 三个驱动躺在主线树里但 Kconfig 依赖不可满足，永远选不上 |
-| 适配厂商引导器的约定 | 次之 | Image 头、fw_table、DTB padding——与内核功能无关，但不做就完全不启动 |
-| 用主线机制表达厂商私有语义 | 中等 | spin-table、irq mux、reset、时钟门 |
-| 真正新写的代码 | 最小 | 一个 ~100 行 thermal 驱动 + 一处 watchdog 补丁 |
-| 从厂商树整体搬运 | 一个文件 | `r8169soc.c`（以太网，厂商 platform 版 r8169） |
+| Making existing mainline drivers selectable | Largest | Three drivers sat in the mainline tree behind Kconfig dependencies that could never be satisfied |
+| Satisfying the vendor bootloader's conventions | Second | Image header, fw_table, DTB padding — nothing to do with kernel features, but without them the machine does not boot at all |
+| Expressing vendor-private semantics with mainline mechanisms | Moderate | spin-table, IRQ mux, reset, clock gates |
+| Genuinely new code | Smallest | One ~100-line thermal driver and one watchdog patch |
+| Carried over wholesale from the vendor tree | One file | `r8169soc.c` (ethernet, the vendor's platform variant of r8169) |
 
-**最反复踩的一类坑**：驱动代码在主线树里，Makefile 也有，但 Kconfig 的 prompt 被不可满足的条件门住，于是 `.config` 里根本不存在该符号，驱动从未被链接。这一类踩了三次（irq mux 的 `if COMPILE_TEST`、`NET_VENDOR_REALTEK depends on PCI`、`R8169SOC depends on ARCH_RTD129x`）。**排查手法**：`grep` 符号名在 `.config` 里零命中 + `System.map` 零命中 = 驱动没编进去，别再怀疑 DTS。
+**The single most repeated trap**: the driver source is in the mainline tree, the Makefile references it, but the Kconfig prompt is gated behind an unsatisfiable condition, so the symbol never exists in `.config` and the driver is never linked. This happened three times (the IRQ mux's `if COMPILE_TEST`, `NET_VENDOR_REALTEK depends on PCI`, and `R8169SOC depends on ARCH_RTD129x`).
 
-**厂商 GPL 包是唯一权威参考**，不是可选读物。位置：
+**How to recognise it**: if `grep` finds the symbol nowhere in `.config` *and* `System.map` has zero hits for the driver's symbols, the driver was never compiled in. Stop suspecting the device tree.
+
+**The vendor GPL drop is required reading, not optional reference.** Locations:
+
 ```
-GPL_MCH_Monarch_9.9.0-102_20251211/   # U-Boot 源码在这里
-GPL_MCH_Monarch_9.7.0-104_20241205/kernel/linux-4.9.330/   # 4.9 内核树
+GPL_MCH_Monarch_9.9.0-102_20251211/                        # U-Boot source
+GPL_MCH_Monarch_9.7.0-104_20241205/kernel/linux-4.9.330/   # 4.9 kernel tree
 ```
-凡是"寄存器语义猜不出来"的地方（thermal 采样序列、type-c lane switch、ISO_ISR 的 W1C 约定、spin-table 的写宽度），答案都在厂商驱动里，而且往往只有几十行。
+
+Every time a register's semantics could not be guessed — the thermal sampling sequence, the Type-C lane switch, the write-1-to-clear contract of ISO_ISR, the width of the spin-table write — the answer was in a vendor driver, and usually in only a few dozen lines.
 
 ---
 
-## 1. 引导链：与内核功能无关，但决定能否出一个字符
+## 1. The boot chain: unrelated to kernel features, but it decides whether you get a single character out
 
-这是整个移植最容易卡死人的部分，因为失败模式是**完全静默**——没有 panic、没有 earlycon、没有任何输出。
+This is where a port like this most often dies, because the failure mode is **total silence** — no panic, no earlycon, no output whatsoever.
 
-### 1.1 存储布局
+### 1.1 Storage layout
 
-设备只有一块 SATA 盘，21 个分区。固件三槽共用一张固件表：
+The device has one SATA disk with 21 partitions. All three firmware slots share a single firmware table:
 
-| 用途 | 分区 | 起始 LBA | 扇区数 |
+| Purpose | Partition | Start LBA | Sectors |
 |---|---|---:|---:|
-| FW_TABLE | sda1 | `0x22` | `0x10`（8192 B） |
-| **FDT_B** | sda6 | `0x31000` | `0x38`（28672 B） |
-| **KERNEL_B** | sda8 | `0x33800` | 随内核大小（6.18.40 r2 为 `0x7ee8`） |
+| FW_TABLE | sda1 | `0x22` | `0x10` (8192 B) |
+| **FDT_B** | sda6 | `0x31000` | `0x38` (28672 B) |
+| **KERNEL_B** | sda8 | `0x33800` | size-dependent (`0x7ee8` for 6.18.40 r2) |
 
-主线内核**只写 B 槽**这三处。A 槽（sda2/5/3）与 GOLD 槽（sda16/10/9）永不触碰——原因见 §1.6，这不是保守，是安全红线。
+The mainline kernel **only ever writes these three**. Slot A (sda2/5/3) and the GOLD slot (sda16/10/9) are never touched — see §1.6; this is a hard safety boundary, not caution.
 
-### 1.2 fw_table 结构（sda1，恰好 8192 字节）
+### 1.2 fw_table structure (sda1, exactly 8192 bytes)
 
 ```
-偏移      内容
-0x00      魔数 "VERONA__"
-0x08      u16 头部校验和  ← 算法：sum(fw[0x0A:]) & 0xFFFF（跳过魔数与自身）
+offset    content
+0x00      magic "VERONA__"
+0x08      u16 header checksum  <- algorithm: sum(fw[0x0A:]) & 0xFFFF (skips magic and itself)
 0x18      u32 part_list_len = 0xC0 (192)
-0x1C      u32 fw_list_len   = 0x1A0 (416 = 13 × 32)
-0x20      分区表 192 字节
-0xE0      13 条固件描述符，每条 32 字节
+0x1C      u32 fw_list_len   = 0x1A0 (416 = 13 * 32)
+0x20      partition table, 192 bytes
+0xE0      13 firmware descriptors, 32 bytes each
 ```
 
-**条目步长是 32 字节。** 早期文档误记为 0xC0，那是每 6 条采样一次造成的错觉。
+**The entry stride is 32 bytes.** An early note recorded it as 0xC0; that was an artifact of sampling every sixth entry.
 
-单条目内的字段偏移（打包脚本实际使用的）：
+Field offsets within one entry, as used by the packaging script:
 
 ```
-+0    u8  type（FW_TYPE）
-+1    u8  flags（0x80）
-+8    u32 载入地址 >> 16
-+14   u32 实际字节数
-+18   u32 分配字节数
-+22   u32 内容附加校验和  ← sum(每个字节) & 0xFFFFFFFF，对补齐后的数据算
++0    u8  type (FW_TYPE)
++1    u8  flags (0x80)
++8    u32 load address >> 16
++14   u32 actual byte count
++18   u32 allocated byte count
++22   u32 additive checksum of the content  <- sum(bytes) & 0xFFFFFFFF over the padded artifact
 ```
 
-FW_TYPE 决定条目归属哪个槽：
+FW_TYPE decides which slot an entry belongs to:
 
-| 槽 | FW_TYPE |
+| Slot | FW_TYPE |
 |---|---|
-| A（`BOOT_NORMAL_MODE`） | KERNEL=2, KERNEL_DT=4, KERNEL_ROOTFS=6, AFW=7 |
-| **B（`BOOT_RESCUE_MODE`，主线内核住这里）** | **RESCUE_KERNEL=43, RESCUE_DT=3**, RESCUE_ROOTFS=5, RESCUE_AUDIO=44 |
-| GOLD（`BOOT_GOLD_MODE`） | 31–34 |
+| A (`BOOT_NORMAL_MODE`) | KERNEL=2, KERNEL_DT=4, KERNEL_ROOTFS=6, AFW=7 |
+| **B (`BOOT_RESCUE_MODE`, where the mainline kernel lives)** | **RESCUE_KERNEL=43, RESCUE_DT=3**, RESCUE_ROOTFS=5, RESCUE_AUDIO=44 |
+| GOLD (`BOOT_GOLD_MODE`) | 31–34 |
 
-启动 B 槽时 U-Boot **只读取并校验 B 槽条目**，A/GOLD 的条目走 `default: continue`，其分区内容根本不被读。这条源码事实很有用：A/GOLD 分区可以改用，只要 sda1 里的描述符字节保持自洽（整表共用一个头部校验和）。
+When booting slot B, U-Boot **reads and verifies only the B entries**; A and GOLD entries fall through `default: continue` and their partition contents are never read. That source-level fact is useful: the A and GOLD partitions can be repurposed as long as the descriptor bytes in sda1 stay self-consistent (one header checksum covers the whole table).
 
-打包时只改两条：文件偏移 **0x1A0**（RESCUE_DT，type `0x03`）和 **0x260**（RESCUE_KERNEL，type `0x2B`=43）的 `+14/+18/+22`，然后重算头部校验和。A/GOLD 条目逐字节保留。
+Packaging therefore patches exactly two entries: file offset **0x1A0** (RESCUE_DT, type `0x03`) and **0x260** (RESCUE_KERNEL, type `0x2B` = 43), fields `+14/+18/+22`, then recomputes the header checksum. A and GOLD entries are preserved byte for byte.
 
-### 1.3 ARM64 Image 头补丁：静默死机的元凶
+### 1.3 The ARM64 Image header patch, or: why the machine went completely silent
 
-**症状**：刷完新内核后完全没有输出，连 earlycon 都没有，像砖了一样。
+**Symptom**: after flashing, nothing at all — not even earlycon. The device looks bricked.
 
-**根因**：6.18 的 PIE/可重定位内核在 Image 头里写 `text_offset = 0`。而厂商二阶段是 U-Boot 2015.07，它的 `booti` 会把 Image **照字面**拷到 `DRAM_BASE + text_offset` = `0x00000000`——正好覆盖 U-Boot 自己和异常向量表。CPU 在解压前就死了，所以一个字符都出不来。
+**Root cause**: a 6.18 PIE/relocatable kernel ships `text_offset = 0` in its Image header. The second-stage bootloader here is U-Boot 2015.07, whose `booti` copies the Image **literally** to `DRAM_BASE + text_offset` = `0x00000000` — squarely on top of U-Boot itself and the exception vector table. The CPU dies before decompression, so not one character escapes.
 
-**修法**：二进制改写 Image 头三个字段（打包脚本已自动化）：
+**Fix**: binary-patch three header fields (automated in the packaging script):
 
 ```python
-struct.pack_into("<I", kernel,  0, 0x91005A4D)   # code0：一条合法 AArch64 指令，兼容 MZ 头
+struct.pack_into("<I", kernel,  0, 0x91005A4D)   # code0: a valid AArch64 instruction, MZ-compatible
 struct.pack_into("<Q", kernel,  8, 0x200000)     # text_offset = 0x200000
 struct.pack_into("<I", kernel, 60, 0x40)         # pe_offset = 0x40
 ```
 
-改之前先校验偏移 56 处的 arm64 魔数 `0x644D5241`（"ARM\x64"），避免改错文件。
+Validate the arm64 magic `0x644D5241` ("ARM\x64") at offset 56 before patching, so you cannot silently corrupt the wrong file.
 
-### 1.4 大小限制与不压缩
+### 1.4 Size limit, and why the image is uncompressed
 
-二阶段 U-Boot 的 `CONFIG_SYS_BOOTM_LEN` 把解压上限卡在约 20 MB，而 6.18 解压后约 22 MB → `inflate() returned -5`。两个应对：
+The second-stage U-Boot's `CONFIG_SYS_BOOTM_LEN` caps decompression at about 20 MB, while 6.18 decompresses to roughly 22 MB → `inflate() returned -5`. Two responses:
 
-- `CONFIG_CC_OPTIMIZE_FOR_SIZE=y` + 关掉调试选项压缩体积；
-- **改走未压缩的 raw Image**——二阶段 U-Boot 被裁到只剩 `booti`/`fdt`，根本没有 `unzip` 命令。
+- `CONFIG_CC_OPTIMIZE_FOR_SIZE=y` plus disabling debug options to shrink the image;
+- **ship a raw, uncompressed Image** — this second-stage U-Boot was trimmed down to `booti`/`fdt` and has no `unzip` command at all.
 
-### 1.5 DTB 的两个陷阱
+### 1.5 Two device-tree traps
 
-**陷阱一：`FDT_ERR_NOSPACE`。** U-Boot 运行时会往 DTB 里插 `/factory` 节点（序列号、MAC、IP 等）。编译 DTB 必须留头部空间：`dtc -p 16384`。
+**Trap one: `FDT_ERR_NOSPACE`.** U-Boot inserts a `/factory` node (serial number, MAC, IP) into the DTB at runtime. Compile with headroom: `dtc -p 16384`.
 
-**陷阱二：padding 不等于可用空间（r2 才修对）。** DTB 补齐到 `0x7000` 字节只是文件变长了；U-Boot/libfdt 判断"还有多少地方能写"看的是 **FDT 头里的大端 `totalsize` 字段（偏移 4）**，不是文件长度。所以补齐后必须把 `totalsize` 一并改写为 `0x7000`，padding 才真正成为运行时可用的 FDT 空间。改完用 `dtc -I dtb -O dts` 反解析验证。
+**Trap two: padding is not the same as usable space** (only fixed correctly in r2). Padding the DTB out to `0x7000` bytes merely makes the file longer. U-Boot/libfdt decides how much room it has from the **big-endian `totalsize` field in the FDT header (offset 4)**, not from the file length. So after padding, `totalsize` must be rewritten to `0x7000` as well before the padding becomes usable runtime FDT space. Verify by round-tripping through `dtc -I dtb -O dts`.
 
-### 1.6 写盘规则与槽位选择
+### 1.6 Write rules and slot selection
 
-`sata write` 按 512 字节整扇区写，多余扇区里是 RAM 残留垃圾，会破坏附加校验和。规则：**主机侧零填充，扇区数必须恰好等于 padded_bytes / 512**。内核补齐到 4096 字节边界。
+`sata write` writes whole 512-byte sectors, and any surplus sector carries leftover RAM garbage that breaks the additive checksum. The rule: **zero-pad on the host, and the sector count must be exactly padded_bytes / 512**. The kernel is padded to a 4096-byte boundary.
 
-写序永远是 **DTB → 内核 → fw_table 最后**。fw_table 是提交点：在它之前任何一步失败，盘上仍是自洽的旧配置，断电重启照旧启动旧内核。
+The write order is always **DTB → kernel → fw_table last**. The fw_table is the commit point: if anything fails before it, the on-disk state is still the self-consistent previous configuration, and a plain power cycle boots the old kernel as before.
 
-槽位由 sda18（FAT32）上 16 字节的 `bootConfig` 文件决定，格式 `<bootState>:<nbr>:<bna>:;`，正常值 `0:F:0:;`。
+Slot selection comes from a 16-byte `bootConfig` file on the FAT32 partition sda18, formatted `<bootState>:<nbr>:<bna>:;`, normally `0:F:0:;`.
 
-| bootState | 行为 |
+| bootState | Behaviour |
 |---|---|
-| 0 NO_OTA | 启动 U-Boot 环境里 `cbr` 指向的槽 |
-| 1 INIT | `cbr=A` 并启动 A |
-| 2 OTA_TRIGGERED | 启动 `nbr`（需 1≤`bna`≤5） |
-| 3 OTA_PASSED | 把 `nbr` 提交为 `cbr` |
-| 4 OTA_FAILED | 退回 `cbr` |
-| **5 RECOVERY** | **启动 GOLD** |
+| 0 NO_OTA | Boot the slot named by `cbr` in the U-Boot environment |
+| 1 INIT | Set `cbr=A` and boot A |
+| 2 OTA_TRIGGERED | Boot `nbr` (requires 1 ≤ `bna` ≤ 5) |
+| 3 OTA_PASSED | Commit `nbr` as `cbr` |
+| 4 OTA_FAILED | Fall back to `cbr` |
+| **5 RECOVERY** | **Boot GOLD** |
 
-两条必须知道的事实：
+Two facts you must internalise:
 
-1. **U-Boot 从不递减 `bna`（源码确认无写回）→ 没有自动回滚。** 选中的槽会一直被启动，直到 bootConfig 再次被改。所以不能指望"新内核失败会自己退回来"。
-2. **GOLD 不是救援环境，是出厂重置器。** 它的 rootfs 是 Android 6.0.1 recovery，`init.rc` 经硬编码的 `ro.debuggable=1` 属性触发器**无条件**启动 `do_reset.sh`，后者按分区号硬编码出厂布局并执行 `mke2fs -E discard`。在重新分区过的盘上这会抹掉用户数据分区，且 `-E discard` 会对 SSD 下发 TRIM，数据在闪存层面即刻不可恢复（本项目 2026-07-27 实测踩中）。**永远不要启动 GOLD。** 好消息是 Realtek 原本"启动失败自动回退 GOLD"的逻辑被 WD 用 `#if 0` 关掉了（注释 KAM-8762），所有失败路径走 USB 救援 → DHCP 救援 → 串口控制台，不会自己掉进 GOLD。
+1. **U-Boot never decrements `bna` (confirmed in the source: there is no write-back), so there is no automatic rollback.** The selected slot keeps booting until `bootConfig` is changed again. Never rely on "a bad kernel will roll itself back".
+2. **GOLD is not a rescue environment; it is a factory reset appliance.** Its rootfs is an Android 6.0.1 recovery whose `init.rc` starts `do_reset.sh` **unconditionally** via a hardcoded `ro.debuggable=1` property trigger. That script hardcodes the *factory* partition numbers and runs `mke2fs -E discard`. On a repartitioned disk this destroys the user data partition, and because `-E discard` issues a full TRIM to the SSD the data is unrecoverable at the flash level the instant it runs. This project hit exactly that on 2026-07-27. **Never boot GOLD.** The good news: Realtek's original "fall back to GOLD when boot fails" logic is disabled by WD inside `#if 0` (comment KAM-8762), so every failure path goes USB rescue → DHCP rescue → serial console and never lands in GOLD on its own.
 
-手动引导（停在二阶段 `Realtek>` 时）：
+Manual boot from the second-stage `Realtek>` prompt:
 
 ```
 booti 0x03000000 - 0x01f00000
 ```
 
-打断二阶段 autoboot 要在 `bootr` **之前** `env set bootdelay 5`，否则窗口太短。TFTP 载入地址统一用 `0x04000000`。
-
+To interrupt the second-stage autoboot, run `env set bootdelay 5` **before** `bootr`; otherwise the window is too short. TFTP load address is uniformly `0x04000000`.
 ---
 
-## 2. 症状 → 根因 → 修法（按时间顺序）
+## 2. Symptom → root cause → fix, in the order they were hit
 
-这一节是排错索引。每条都是真机实测确认过的，不是推测。
+This section doubles as a troubleshooting index. Every entry was confirmed on real hardware, not reasoned about in the abstract.
 
-### 2.1 引导链阶段（2026-04）
+### 2.1 Boot chain (April 2026)
 
-**① 完全静默，连 earlycon 都没有**
-PIE 内核 `text_offset=0`，U-Boot 2015.07 `booti` 拷到地址 0 覆盖了自己。→ 二进制改 Image 头（§1.3）。
+**① Total silence, not even earlycon**
+PIE kernel with `text_offset=0`; U-Boot 2015.07 `booti` copies it to address 0 and overwrites itself. → Binary-patch the Image header (§1.3).
 
 **② `inflate() returned -5`**
-`CONFIG_SYS_BOOTM_LEN` ≈20 MB < 22 MB 解压体积。→ 缩小体积 + 改走未压缩 Image（§1.4）。
+`CONFIG_SYS_BOOTM_LEN` ≈ 20 MB < the 22 MB decompressed size. → Shrink the image and ship it uncompressed (§1.4).
 
-**③ DTB 里的 `bootargs` 不生效**
-默认 `CONFIG_CMDLINE_FROM_BOOTLOADER=y`，U-Boot 传来的空/错 bootargs 赢了。→ `CONFIG_CMDLINE_FORCE=y`，并把 `earlycon=uart8250,mmio32,0x98007800 console=ttyS0,115200 panic=5` 写死进 `CONFIG_CMDLINE`。
-⚠️ 遗留隐患：板级 DTS 的 `bootargs` 至今写着 `root=/dev/sda9 rootfstype=ext4`（sda9 其实是 gzip+cpio 流，不是 ext4），目前只是被 `CMDLINE_FORCE` 盖住。哪天去掉 FORCE 就会炸。
+**③ `bootargs` in the DTB has no effect**
+`CONFIG_CMDLINE_FROM_BOOTLOADER=y` is the default, so U-Boot's empty/incorrect bootargs win. → `CONFIG_CMDLINE_FORCE=y`, with `earlycon=uart8250,mmio32,0x98007800 console=ttyS0,115200 panic=5` baked into `CONFIG_CMDLINE`.
+⚠️ Latent hazard: the board DTS still says `root=/dev/sda9 rootfstype=ext4` (sda9 is actually a gzip+cpio stream, not ext4). It is only harmless because `CMDLINE_FORCE` overrides it. Remove FORCE some day and this bites.
 
-**④ AHCI 探测失败 `-EBUSY: can't request region [mem 0x9803f000-...]`**
-厂商 DTS 的 `rsvmem-remap` 节点 `rbus@98000000` 圈了 `0x98000000–0x981fffff`，把 SATA 控制器的 MMIO 一起包进去了。→ DTS 里删掉**所有** `rsvmem-remap` 节点。
+**④ AHCI probe fails with `-EBUSY: can't request region [mem 0x9803f000-...]`**
+The vendor DTS `rsvmem-remap` node `rbus@98000000` reserves `0x98000000–0x981fffff`, swallowing the SATA controller's MMIO. → Delete **all** `rsvmem-remap` nodes from the board DTS.
 
-**⑤ 32 位厂商用户态二进制 `Exec format error`**
-→ `CONFIG_COMPAT=y`。
+**⑤ 32-bit vendor userspace binaries fail with `Exec format error`**
+→ `CONFIG_COMPAT=y`.
 
-**⑥ `init: required argument missing.` 然后掉进 BusyBox**
-Debian 的 `/sbin/init` 是 systemd（usr-merge），systemd 以 system 模式运行时**要求自己是 PID 1**，而 `chroot` 不替换 PID 1。
-佐证：厂商自己的 Debian 安装包早期用户态用的就是 `exec switch_root /mnt /sbin/init`——官方路径本来就是 switch_root。
-→ initramfs 的 Debian/mdraid 分支改用 `exec /bin/busybox switch_root -c /dev/console "$root" "$init"`，并加 `cleanup_newroot()` 清理失败残留（这同时解决了重试时的 `mounting sysfs on /newroot/sys failed: -EBUSY`）。
-⚠️ 厂商 gzip+cpio 救援分支**故意保留 chroot**：那条路径上 vendor init 退出会让 PID1 panic。
-⚠️ BusyBox 的 `switch_root` 自身也要求调用者是 PID 1，所以 initramfs 必须保持 PID 1。
+**⑥ `init: required argument missing.` then a drop to BusyBox**
+Debian's `/sbin/init` is systemd (usr-merge), and systemd in system mode **requires being PID 1**; `chroot` does not replace PID 1.
+Corroboration: the vendor's own Debian package uses `exec switch_root /mnt /sbin/init` in its early userspace — switch_root was always the intended path.
+→ The Debian/mdraid branch of the initramfs now uses `exec /bin/busybox switch_root -c /dev/console "$root" "$init"`, plus a `cleanup_newroot()` helper (which also fixed `mounting sysfs on /newroot/sys failed: -EBUSY` on retries).
+⚠️ The vendor gzip+cpio rescue branch **deliberately keeps `chroot`**: on that path the vendor init exiting as PID 1 would panic the kernel.
+⚠️ BusyBox's own `switch_root` also demands that the caller be PID 1, so the initramfs must stay PID 1.
 
-### 2.2 功能补全阶段（2026-07）
+### 2.2 Feature completion (July 2026)
 
-**⑦ SMP 硬挂在副核唤醒前（无 panic、无输出）**
-主线 `smp_spin_table.c` 对 release address 用 `ioremap_cache`（可缓存映射）+ 64 位 `writeq` + dcache 维护；但 `0x9801AA44` 是**设备寄存器区**，这么访问会把总线锁死。厂商 `rtd129x_spin_table.c` 用的是 plain `ioremap` + 32 位 `writel_relaxed`。
-→ 见 §3.1 的 `smp_spin_table.c` 补丁。一次命中，四核起来。
+**⑦ SMP hard-hangs before secondary CPUs come up (no panic, no output)**
+Mainline `smp_spin_table.c` maps the release address with `ioremap_cache`, writes it with a 64-bit `writeq`, and performs dcache maintenance. But `0x9801AA44` is a **device register**, not RAM, and that access pattern locks up the interconnect. The vendor's `rtd129x_spin_table.c` uses plain `ioremap` with a 32-bit `writel_relaxed`.
+→ See the `smp_spin_table.c` patch in §4.1. Worked on the first attempt; four cores came up.
 
-**⑧ switch_root 成功但 systemd 冻结：`Failed to mount cgroup v1 hierarchy`**
-瘦身配置裁掉了 CGROUPS/SYSVIPC/POSIX_MQUEUE/TMPFS_POSIX_ACL/AUTOFS_FS。→ `rtd1295_systemd.config` 片段。补上后 34 秒到 `graphical.target`。
+**⑧ switch_root succeeds but systemd freezes: `Failed to mount cgroup v1 hierarchy`**
+The size-trimmed config had dropped CGROUPS, SYSVIPC, POSIX_MQUEUE, TMPFS_POSIX_ACL and AUTOFS_FS. → The `rtd1295_systemd.config` fragment. With it, 34 s to `graphical.target`.
 
-**⑨ uart0 挂上 irq mux 后控制台彻底死掉（无 ttyS0 → init 死）**
-`irq-rtd129x.c` 在主线树里、Makefile 也有，但 Kconfig 的 prompt 被 `if COMPILE_TEST` 门住 → `.config` 里没有 `CONFIG_IRQ_RTD129X_MUX` 这个符号 → 驱动从未链接 → uart0 的 `interrupt-parent` 指向一个永不绑定的 irqchip → fw_devlink 无限 defer。
-（此前能用控制台是因为 DTB 没写 `interrupts` 属性，dw8250 报 ENXIO 后退化成轮询模式。）
-→ 去掉 COMPILE_TEST 门，`CONFIG_IRQ_RTD129X_MUX=y`。
+**⑨ Wiring uart0 to the IRQ mux kills the console entirely (no ttyS0 → init dies)**
+`irq-rtd129x.c` was in the tree with a Makefile entry, but its Kconfig prompt was gated behind `if COMPILE_TEST`, so `CONFIG_IRQ_RTD129X_MUX` never existed in `.config`, the driver was never linked, and uart0's `interrupt-parent` pointed at an irqchip that would never bind — fw_devlink deferred forever.
+(The console had worked earlier only because the DTB omitted `interrupts`, so dw8250 reported ENXIO and fell back to polling.)
+→ Remove the COMPILE_TEST gate; `CONFIG_IRQ_RTD129X_MUX=y`.
 
-**⑩ ttyS0 拿到真中断后出现自维持日志风暴（150 秒 607 行）**
-两层根因：
-- 主线 8250 不会 ACK ISO mux 的状态寄存器（厂商靠自家 8250 fork 配 `interrupts-st-mask` 做这件事）；
-- **mux handler 里的 `pr_err` 打到了骑在同一个 UART 上的 console** → 每打一行就产生 TX 中断 → 再进 handler → 再打印。自我喂养。
+**⑩ Once ttyS0 has a real IRQ, a self-sustaining log storm appears (607 lines in 150 s)**
+Two layers:
+- mainline's 8250 never acks the ISO mux status register (the vendor did this from a forked 8250 driver via `interrupts-st-mask`);
+- the mux handler's own `pr_err` writes to the console **riding the very UART being muxed** → each printed line raises a TX interrupt → re-enter the handler → print again. Self-feeding.
 
-顺带一个**方法论陷阱**：当时观测到 ISO_ISR bit2"写了清不掉"，判断为硬件卡死。其实是测量假象——devmem 探针命令本身走同一个串口，每条命令的收发就是新的 uart 中断，把刚清掉的位又置回来了。用**同一行命令零流量清+读**，回读是 0，W1C 完全正常（寄存器约定见厂商 `rtk_iso.h`：`BIT(n)|0` 清、`BIT(n)|1` 置）。
-→ 见 §3.2：dispatch 前先 W1C ACK + 热路径删除所有 printk + 删掉厂商"强清"死代码。
-**教训**：console 所在总线的中断处理器里，永远不要 printk。
+There was also a **methodological trap** worth remembering. ISO_ISR bit 2 appeared to be "stuck at 1, cannot be cleared", which looked like broken hardware. It was a measurement artifact: each `devmem` probe command travelled over the same serial port, and its own traffic re-latched the bit that had just been cleared. Clearing and reading **in a single command line with no traffic in between** returned 0 — write-1-to-clear works exactly as documented (the register contract is in the vendor's `rtk_iso.h`: `BIT(n)|0` clears, `BIT(n)|1` sets).
+→ See §4.2: ack (W1C) before dispatch, delete every printk from the hot path, and delete the vendor's dead "force clear" tail.
+**Lesson: never printk inside the interrupt handler of the bus your console sits on.**
 
-**⑪ Debian 起来了但没有登录提示**
-镜像里 `/etc/systemd/system/serial-getty@ttyS0.service -> /dev/null`（做镜像时 mask 掉的）。→ initramfs 的 `apply_rootfs_fixups()` 在 switch_root 前删掉该 mask，getty-generator 会自动实例化。
+**⑪ Debian boots but there is no login prompt**
+The image ships `/etc/systemd/system/serial-getty@ttyS0.service -> /dev/null` (masked when the image was built). → `apply_rootfs_fixups()` in the initramfs removes the mask before switch_root; systemd's getty generator then instantiates it.
 
-**⑫ 以太网驱动在菜单里根本选不出来**
-`NET_VENDOR_REALTEK depends on PCI || (PARPORT && X86)`——这块 SoC 没有 PCI。→ 加 `|| ARCH_REALTEK`。（"驱动已移植但选不上"家族的第三次）
+**⑫ The ethernet driver cannot even be selected in menuconfig**
+`NET_VENDOR_REALTEK depends on PCI || (PARPORT && X86)` — this SoC has no PCI. → Add `|| ARCH_REALTEK`. (Third member of the "ported but unselectable" family.)
 
-**⑬ 以太网 probe Oops → panic**
-`rtl_init_one` 里有两处漏改的裸 `clk_get`，返回的 ERR_PTR 流进 `__clk_is_enabled`。RTD129x 没有主线时钟驱动，时钟只能靠 bootloader 留下的门。→ 换成 `rtl_clk_get_optional` helper，返回 NULL 时走直接寄存器 bring-up 分支。修好后 eth0 从硬件读回出厂 MAC，千兆协商成功。
-（已知无害噪声：`rtl_csiar_cond` 超时告警 ×2。）
+**⑬ Ethernet probe oopses, then panics**
+Two bare `clk_get` calls were missed during the April adaptation; the returned `ERR_PTR` flowed into `__clk_is_enabled`. RTD129x has no mainline clock driver, so clocks depend on the gates the bootloader leaves open. → Replace with an `rtl_clk_get_optional` helper that returns NULL, which routes the driver to its direct-register bring-up path. Afterwards eth0 reads its factory MAC from hardware and negotiates gigabit.
+(Known harmless noise: two `rtl_csiar_cond` timeout warnings.)
 
-**⑭ USB：裸 `snps,dwc3` 节点报 `-EBUSY`，资源区间倒挂**
-主线 dwc3 把 globals 块硬编码在 0xc100，RTD1295 实际是 **0x8100**（厂商 `fixed_dwc3_globals_regs_start`）。
-→ 解法不是打补丁：父节点用 compatible **`realtek,rtd-dwc3`**，触发主线内置的 RTD globals-offset quirk。（dwc3-rtk glue、phy-rtk-usb2/usb3 全都已在主线树里。）
+**⑭ USB: a bare `snps,dwc3` node reports `-EBUSY` with an inverted resource range**
+Mainline dwc3 hardcodes the globals block at 0xc100; on the RTD1295 it is **0x8100** (the vendor's `fixed_dwc3_globals_regs_start`).
+→ The fix is not a patch: give the parent node the compatible **`realtek,rtd-dwc3`**, which triggers the RTD globals-offset quirk already present in mainline. (dwc3-rtk glue and phy-rtk-usb2/usb3 are all already in-tree.)
 
-**⑮ dwc3 probe 读 GSNPSID 得到垃圾**
-`clk_en_usb`（CRT 0x0c bit4）**bootloader 默认关闭**，而 initramfs 里 poke 这个门的时机晚于 probe。用运行时 rebind 实验确诊（门一开 xHCI 立刻注册）。→ dwc3-rtk probe 对 rtd1295 先开门（无时钟驱动前的 quirk）。
+**⑮ dwc3 probe reads garbage from GSNPSID**
+`clk_en_usb` (CRT 0x0c bit 4) is **left closed by the bootloader**, and the initramfs poke that opened it ran later than probe. Diagnosed by rebinding the driver at runtime (xHCI registered the instant the gate opened). → dwc3-rtk probe opens the gate itself on rtd1295 (a quirk until a clock driver exists).
 
-**⑯ 根集线器全起来了但永远枚举不到设备**
-物理 USB-A 口挂在 **DRD 块**上（厂商跑 adb gadget + 软件切角色；u2host/u3host 是空焊盘）。→ DRD 按 host 使能（wrapper @13200、核 @20000、GIC SPI 21、双 phy）；VBUS 由 initramfs 拉高 misc-gpio19（0x9801b100 / 0x9801b110 bit19）。4 TB 盘 9 秒枚举。
+**⑯ Root hubs come up but no device ever enumerates**
+The physical USB-A port hangs off the **DRD block** (the vendor ran an adb gadget with a software role switch; the u2host/u3host ports are unpopulated pads). → Enable DRD in host mode in the DTS (wrapper @13200, core @20000, GIC SPI 21, both PHYs); VBUS is raised by the initramfs via misc-gpio19. A 4 TB disk enumerated in 9 s.
 
-**⑰ USB 链路只到 High-Speed（38 MB/s）**
-Type-C lane switch 寄存器 **0x9801334c 的复位值是"断开"**，尽管物理口是固定 Type-A。→ 置 bit29（使能）+ 清 bit28:27（CC1 方向），立刻跳上 5 Gbps 总线，实测 137 MB/s（已是机械盘极限）。配方出处：厂商 `rtk_usb_rtd129x.c` 的 `TYPE_C_EN_SWITCH BIT(29)` / `TYPE_C_TxRX_sel BIT(28)|BIT(27)`。固化进 dwc3-rtk quirk（与 clk_en_usb 同块，幂等）。
+**⑰ The link only reaches High-Speed (38 MB/s)**
+The Type-C lane switch register **0x9801334c resets to "disconnected"**, even though the physical port is a fixed Type-A. → Set bit 29 (enable) and clear bits 28:27 (CC1 direction); the drive jumps onto the 5 Gbps bus immediately, measured 137 MB/s (the drive's own mechanical limit). Recipe from the vendor's `rtk_usb_rtd129x.c`: `TYPE_C_EN_SWITCH BIT(29)`, `TYPE_C_TxRX_sel BIT(28)|BIT(27)`.
 
-**⑱ 温度传感器**
-传感器在 **scpu_wrapper 0x9801d000 + 0x150**。第一次按 CRT+0x150 猜，读回 `0xDEADBEEF`——这是 RBUS 对无效区域的标志性回读，可以当"地址错了"的信号用。
-协议：CTRL2（0x9801d158）依次写 `0x01904001` → `0x01924001` 初始化；STATUS1（0x9801d168）读数按 **18 位符号扩展 × 1000 / 1024 = m°C**。厂商驱动仅 83 行。→ 新写 ~100 行 `drivers/thermal/rtd129x_thermal.c`。
+**⑱ Thermal sensor**
+The sensor lives at **scpu_wrapper 0x9801d000 + 0x150**. The first guess, CRT+0x150, read back `0xDEADBEEF` — RBUS's signature response for an invalid region, which makes a **reliable "wrong address" signal** while probing.
+Protocol: write `0x01904001` then `0x01924001` to CTRL2 (0x9801d158) to arm; read STATUS1 (0x9801d168) and interpret it as an **18-bit signed value × 1000 / 1024 = m°C**. The vendor driver is 83 lines. → A new ~100-line `drivers/thermal/rtd129x_thermal.c`.
 
-**⑲ `reboot` 把机器停住而不是重启**
-本固件没有 PSCI，看门狗是唯一复位通道。→ 给 `rtd119x_wdt` 加 `.restart`（1 ms 溢出 + 使能 + 自旋，优先级 192）。`systemctl reboot` 实测 34 秒下线→上线。
-⚠️ 踩坑：用 `nohup` 后台发 reboot 会被 sshd 会话清理吞掉（当时误判为"没执行"），同步下发即可。
+**⑲ `reboot` halts the machine instead of restarting it**
+This firmware has no PSCI, so the watchdog is the only reset channel. → Add `.restart` to `rtd119x_wdt` (1 ms timeout, enable, spin; priority 192). `systemctl reboot` measured at 34 s down-to-up.
+⚠️ Trap: sending `reboot` through `nohup` in the background gets swallowed by sshd session cleanup (initially misread as "the command did nothing"). Issue it synchronously.
 
-**⑳ RTC 能 probe 但不走针（搁置）**
-DTS 加 `rtc@600`（ISO 块）后 rtc-rtd119x probe 成功、`/dev/rtc0` 出现，但 epoch 冻结——缺厂商的使能序列（ISO_RTC ctrl / RTCEN 魔法值，在厂商 rtk-rtc 驱动里）。此机时间靠 NTP、断电靠智能插座，价值低，主动搁置。想修就去 GPL 包 rtc 驱动抄使能位。
+**⑳ RTC probes but does not tick (shelved)**
+Adding `rtc@600` (ISO block) to the DTS makes rtc-rtd119x probe successfully and `/dev/rtc0` appear, but the epoch stays frozen — the vendor's enable sequence (ISO_RTC ctrl / RTCEN magic values, in the vendor rtk-rtc driver) is missing. Deliberately shelved: NTP covers timekeeping and a smart plug covers power cycling. To fix it, copy the enable bits from the GPL package's rtc driver.
 
-### 2.3 6.18.40 升级阶段（2026-07-28）
+### 2.3 The 6.18.40 upgrade (2026-07-28)
 
-**㉑ 全新检出构建出的内核掉进 netrescue，`grep: not found` 刷屏**
-**git 不能跟踪空目录。** initramfs 源目录里的 `dev/ proc/ sys/ tmp/ usr/bin/ usr/sbin/` 七个空目录从未进过版本库，全新 worktree 检出后就没了 → `mount -t proc proc /proc` 失败 → **BusyBox 的 standalone shell 靠 `/proc/self/exe` 定位自身来分发内建 applet**，`/proc` 一没，`grep`/`sed`/`tr` 全部"not found" → netrescue 连自己的 IP 都读不出来，误判 DHCP 失败退到备用地址，把自己踢出网段。
-→ 加 `.gitkeep` 占位文件让版本库能带上目录；同时让 `init` 自建挂载点（`mkdir -p /proc /sys /tmp /newroot /run`），这样任何残缺检出都不会再复现。
-**教训**：任何依赖目录骨架的构建输入，都要有"目录不存在也能自愈"的兜底。
+**㉑ A kernel built from a fresh checkout drops into network rescue, with `grep: not found` scrolling past**
+**Git cannot track empty directories.** The seven empty mount-point directories in the initramfs source (`dev/ proc/ sys/ tmp/ usr/bin/ usr/sbin/`) had never been committed, so a fresh worktree checkout simply lacked them → `mount -t proc proc /proc` failed → **BusyBox's standalone shell locates its own binary through `/proc/self/exe` to dispatch built-in applets**, so with `/proc` missing, `grep`, `sed` and `tr` were all "not found" → the rescue script could not even read back its own IP address, concluded DHCP had failed, and moved itself to a fallback address off the local subnet.
+→ Add `.gitkeep` placeholders so checkouts carry the directories, **and** make `init` create its own mount points (`mkdir -p /proc /sys /tmp /newroot /run`) so a stripped checkout can never reproduce this.
+**Lesson: any build input that depends on a directory skeleton needs a fallback for the skeleton not being there.**
 
 ---
 
-## 3. 网络救援（netrescue）：把串口需求降为可选
+## 3. Network rescue: making the serial cable optional
 
-移植期最贵的成本不是写代码，是**每次验证都要接串口线**。所以 initramfs 里内建了网络救援。
+The most expensive part of this port was not writing code — it was needing a serial cable for every single verification cycle. So network rescue is built into the initramfs.
 
-**触发**（两条，都是一次性的）：
-- 自动——所有根文件系统交接路径都失败时；
-- 手动——`mch-boot rescue` 在 sda18 放一个 `netrescue` marker，**initramfs 消费后立刻删除**。一次性设计是刻意的：救援模式绝不能把机器困住。
+**Triggers** (both one-shot):
 
-**动作**：挂 devpts → 写 `/etc/passwd` → `udhcpc`（失败回落 192.168.1.222/24）→ `mdadm --assemble --scan` → 起 telnetd + ftpd，串口 shell 同时保留。重启后约 20 秒可 telnet。
+- automatic, when every root filesystem handoff path has failed;
+- manual, when `mch-boot rescue` drops a `netrescue` marker on sda18, which the initramfs **consumes and immediately deletes**. The one-shot behaviour is deliberate: a rescue mode must never be able to trap the machine.
 
-**四轮迭代的坑**（全部真机测出）：
+**Actions**: mount devpts → write `/etc/passwd` → `udhcpc` (falling back to 192.168.1.222/24) → `mdadm --assemble --scan` → start telnetd and ftpd, keeping the serial shell as well. Telnet is available about 20 s after reboot.
 
-1. telnet 端口开了，但第一个连接一进来就死 → 缺 `/dev/pts`（devpts 没挂）。busybox telnetd 分配 pty 失败即退出。厂商 rescue init 里正好有这两行，当时漏了。
-2. 能反复连接了，但 `/dev/md1` 不存在 → 救援的主要用途就是修根文件系统，必须 `mdadm --assemble --scan`。
-3. 实测通过：telnet 进去 `mount /dev/md1 /mnt` → 可读写 `/etc/fstab` → 干净 umount。
-4. 救援 banner 增加 IPv6 地址播报。
+**Four iterations, every bug found on hardware**:
 
-⚠️ 安全性：这是**无认证的 root telnet**，只适合可信局域网。它是调试设施，不是产品特性。
+1. The telnet port opened but the first connection died instantly → `/dev/pts` was missing (devpts not mounted). BusyBox telnetd exits when it cannot allocate a pty. The vendor's rescue init has exactly those two lines; they had been overlooked.
+2. Connections worked but `/dev/md1` did not exist → repairing the root filesystem is the whole point of rescue, so `mdadm --assemble --scan` was added.
+3. Verified end to end: telnet in, `mount /dev/md1 /mnt`, edit `/etc/fstab`, clean unmount.
+4. Added IPv6 addresses to the rescue banner.
 
-## 4. 逐文件源码改动说明
+⚠️ Security: this is **unauthenticated root telnet**. It belongs on a trusted LAN only. It is debug infrastructure, not a product feature.
+---
 
-基线：**未修改的 Linux 6.18.40**（kernel.org 原版）。本树 42 个文件与之不同：22 个修改、20 个新增，合计 12,994 行差异（其中 `r8169soc.c` 一个文件占 8,906 行）。
+## 4. Per-file account of the source changes
 
-厂商对照基线：`GPL_MCH_Monarch_9.7.0-104_20241205/kernel/linux-4.9.330/`。从厂商树搬运的文件另附"相对厂商原版"的差异行数，用来说明搬运时到底改了多少。
+Baseline: **unmodified Linux 6.18.40** from kernel.org. This tree differs in 42 files — 22 modified, 20 new — totalling 12,994 diff lines, of which `r8169soc.c` alone accounts for 8,906.
 
-复现这些 diff 的脚本在 `porting-guide-material/make-diffs.sh`（构建服务器）。
+Vendor baseline for comparison: `GPL_MCH_Monarch_9.7.0-104_20241205/kernel/linux-4.9.330/`. For files carried over from the vendor tree, a second line count is given against the vendor original, to show how much actually had to change during the move.
 
-### 4.0 一览表
+The script that reproduces these diffs is `porting-guide-material/make-diffs.sh` on the build server.
 
-| 文件 | 状态 | vs 主线 | vs 厂商 | 一句话 |
+### 4.0 Overview
+
+| File | State | vs mainline | vs vendor | Summary |
 |---|---|---:|---:|---|
-| `arch/arm64/Kconfig.platforms` | 改 | 18 | — | 新增 `ARCH_RTD129x` 子family 符号 |
-| `arch/arm64/kernel/smp_spin_table.c` | 改 | 42 | — | release addr 是 MMIO 时改用 32 位设备写 |
-| `arch/arm64/boot/dts/realtek/Makefile` | 改 | 10 | — | 注册板级 dtb |
-| `arch/arm64/boot/dts/realtek/rtd129x.dtsi` | 改 | 10 | — | 删掉 rbus 节点的 `reg` |
-| `arch/arm64/boot/dts/realtek/rtd1295-wd-mycloud-home.dts` | **新** | 514 | — | 板级 DTS |
-| `drivers/irqchip/irq-rtd129x.{c,h}` | **新** | 303+127 | 141 / 0 | 厂商 IRQ mux，加 ack-first、去 printk |
-| `drivers/irqchip/{Kconfig,Makefile}` | 改 | 16+7 | — | 去掉 `COMPILE_TEST` 门 |
-| `drivers/net/ethernet/realtek/r8169soc.c` | **新** | 8,903 | 450 | 厂商 platform 版 r8169，近乎逐字搬运 |
-| `drivers/net/ethernet/realtek/{Kconfig,Makefile}` | 改 | 32+7 | — | `NET_VENDOR_REALTEK` 加 `\|\| ARCH_REALTEK` |
-| `drivers/usb/dwc3/dwc3-rtk.c` | 改 | 40 | — | 开 clk_en_usb 门 + 钉 type-c lane switch |
-| `drivers/watchdog/rtd119x_wdt.c` | 改 | 43 | — | 加 `.restart`（本机唯一复位通道） |
-| `drivers/thermal/rtd129x_thermal.c` | **新** | 79 | 144 | 重写的温度传感驱动 |
-| `drivers/thermal/{Kconfig,Makefile}` | 改 | 14+7 | — | 新符号 |
-| `drivers/soc/realtek/rtk-memory-remap.c` | **新** | 100 | 313 | `rsvmem-remap` 保留内存语义 |
-| `drivers/soc/realtek/{Kconfig,Makefile}` + `drivers/soc/{Kconfig,Makefile}` | 新/改 | 各 ~10 | — | 挂上 realtek 子目录 |
-| `include/linux/soc/realtek/rtk_rsvmem.h` | **新** | 11 | 无对应 | 本项目自写的 API 头 |
-| `include/soc/realtek/rtk_chip.h` | **新** | 47 | 39 | 芯片识别 |
-| `drivers/i2c/busses/i2c-rtk.c` + Kconfig/Makefile | **新**/改 | 983 | 211 | 厂商 I2C（编成模块，未加载，见 §4.9） |
-| `drivers/mfd/g2227-i2c.c`、`g22xx-core.c` + 2 头文件 | **新** | 133+43+224 | 26 / 0 / 0 | GMT G2227 PMIC |
-| `drivers/regulator/g2227-regulator.c`、`g22xx-regulator-core.c` 等 | **新** | 196+342+71 | 0 / 72 / 0 | PMIC 稳压器 |
-| `drivers/phy/realtek/phy-rtk-sata.c` + Kconfig/Makefile | **新**/改 | 431 | 809 | SATA PHY（`=y`，启动盘依赖） |
+| `arch/arm64/Kconfig.platforms` | mod | 18 | — | Adds the `ARCH_RTD129x` sub-family symbol |
+| `arch/arm64/kernel/smp_spin_table.c` | mod | 42 | — | Use a 32-bit device write when the release address is MMIO |
+| `arch/arm64/boot/dts/realtek/Makefile` | mod | 10 | — | Register the board dtb |
+| `arch/arm64/boot/dts/realtek/rtd129x.dtsi` | mod | 10 | — | Drop `reg` from the rbus node |
+| `arch/arm64/boot/dts/realtek/rtd1295-wd-mycloud-home.dts` | **new** | 514 | — | Board device tree |
+| `drivers/irqchip/irq-rtd129x.{c,h}` | **new** | 303+127 | 141 / 0 | Vendor IRQ mux, plus ack-first and printk removal |
+| `drivers/irqchip/{Kconfig,Makefile}` | mod | 16+7 | — | Remove the `COMPILE_TEST` gate |
+| `drivers/net/ethernet/realtek/r8169soc.c` | **new** | 8,903 | 450 | Vendor platform r8169, carried over near-verbatim |
+| `drivers/net/ethernet/realtek/{Kconfig,Makefile}` | mod | 32+7 | — | `NET_VENDOR_REALTEK` gains `\|\| ARCH_REALTEK` |
+| `drivers/usb/dwc3/dwc3-rtk.c` | mod | 40 | — | Open clk_en_usb, pin the Type-C lane switch |
+| `drivers/watchdog/rtd119x_wdt.c` | mod | 43 | — | Add `.restart` (the only reset channel on this board) |
+| `drivers/thermal/rtd129x_thermal.c` | **new** | 79 | 144 | Rewritten thermal sensor driver |
+| `drivers/thermal/{Kconfig,Makefile}` | mod | 14+7 | — | New symbol |
+| `drivers/soc/realtek/rtk-memory-remap.c` | **new** | 100 | 313 | `rsvmem-remap` reserved-memory semantics |
+| `drivers/soc/realtek/{Kconfig,Makefile}`, `drivers/soc/{Kconfig,Makefile}` | new/mod | ~10 each | — | Hook up the realtek subdirectory |
+| `include/linux/soc/realtek/rtk_rsvmem.h` | **new** | 11 | no counterpart | API header written for this port |
+| `include/soc/realtek/rtk_chip.h` | **new** | 47 | 39 | Chip identification |
+| `drivers/i2c/busses/i2c-rtk.c` + Kconfig/Makefile | **new**/mod | 983 | 211 | Vendor I2C (built as a module, never loaded — see §4.9) |
+| `drivers/mfd/g2227-i2c.c`, `g22xx-core.c` + 2 headers | **new** | 133+43+224 | 26 / 0 / 0 | GMT G2227 PMIC |
+| `drivers/regulator/g2227-regulator.c`, `g22xx-regulator-core.c`, header | **new** | 196+342+71 | 0 / 72 / 0 | PMIC regulators |
+| `drivers/phy/realtek/phy-rtk-sata.c` + Kconfig/Makefile | **new**/mod | 431 | 809 | SATA PHY (`=y`, the boot disk depends on it) |
 
-**没有删除任何主线文件；核心内核只动了 `smp_spin_table.c` 一处。**
+**No mainline file was deleted, and the only core-kernel change is the one hunk in `smp_spin_table.c`.**
 
 ---
 
-### 4.1 `arch/arm64/kernel/smp_spin_table.c` — 唯一的核心内核改动
+### 4.1 `arch/arm64/kernel/smp_spin_table.c` — the only core-kernel change
 
-**为什么必须改**：厂商用私有 `enable-method = "rtk-spin-table"`，主线不认。改用主线的 `"spin-table"` 并沿用厂商的 release address `0x9801aa44` 后，内核在唤醒副核前**硬挂**，没有 panic、没有输出。
+**Why it was needed**: the vendor uses a private `enable-method = "rtk-spin-table"` that mainline does not recognise. Switching to mainline's `"spin-table"` while keeping the vendor's release address `0x9801aa44` made the kernel **hard-hang** before waking the secondary CPUs — no panic, no output.
 
-根因是主线实现对 release address 的访问方式：`ioremap_cache`（可缓存映射）+ 64 位 `writeq` + dcache 维护。但 `0x9801AA44` 不是 RAM，是 SoC 寄存器块里的一个 **32 位设备寄存器**。用可缓存映射 + 64 位写 + cache 维护去操作它，会把互连总线锁死。
+The cause is how mainline accesses that address: `ioremap_cache` (a cacheable mapping), a 64-bit `writeq`, and dcache maintenance. But `0x9801AA44` is not RAM — it is a **32-bit device register** inside a SoC block. Driving it that way locks up the interconnect.
 
-厂商 `rtd129x_spin_table.c` 的做法是 plain `ioremap` + 32 位 `writel_relaxed`。
+The vendor's `rtd129x_spin_table.c` uses plain `ioremap` with a 32-bit `writel_relaxed`.
 
-**改法**（不用板级 `#ifdef`，而是通用条件判断）：
+**The change** — a generic condition rather than a board `#ifdef`:
 
 ```c
 +#include <linux/memblock.h>
@@ -330,19 +335,19 @@ DTS 加 `rtc@600`（ISO 块）后 rtc-rtd119x probe 成功、`/dev/rtc0` 出现�
 +	}
 ```
 
-用 `memblock_is_map_memory()` 判断"这个地址是不是普通内存"：不是就走设备寄存器路径，是就走主线原路径。release addr 在 RAM 里的正常板子行为完全不变。
+`memblock_is_map_memory()` answers "is this address normal memory?". If not, take the device-register path; if so, take the original mainline path. Boards whose release address really is in RAM behave exactly as before.
 
-**注意适用范围**：这只覆盖**冷启动唤醒**（写 pen 地址 + `sev()`），厂商的冷启动协议本来就与主线接近。CPU 热插拔需要 `rtk_cpu_power_up` / SMC 那一整套，本移植没做。
+**Scope**: this covers **cold boot only** (write the pen address, then `sev()`), which is where the vendor protocol is already close to mainline. CPU hotplug would need the vendor's whole `rtk_cpu_power_up`/SMC machinery, which this port does not implement.
 
 ---
 
-### 4.2 `drivers/irqchip/irq-rtd129x.{c,h}` — 厂商 IRQ mux
+### 4.2 `drivers/irqchip/irq-rtd129x.{c,h}` — the vendor IRQ mux
 
-厂商这块 SoC 的很多外设中断（含 uart0）不直接进 GIC，而是走私有的 `Realtek,rtk-irq-mux` 二级复用器。**主线 6.18.40 里没有这个驱动**（本文件是从厂商树搬来的：厂商 341 行 → 本树 303 行，差异 141 行；头文件与厂商逐字节相同）。
+Many peripheral interrupts on this SoC, uart0 among them, do not reach the GIC directly; they pass through a private second-level multiplexer, `Realtek,rtk-irq-mux`. **Mainline 6.18.40 has no driver for it**, so this file was carried over from the vendor tree: 341 vendor lines → 303 here, 141 diff lines; the header is byte-identical to the vendor's.
 
-搬运时的两处实质改动：
+Two substantive changes were made during the move.
 
-**① dispatch 前先 W1C ACK 状态位。** 厂商是靠自家 fork 的 8250 驱动通过 `interrupts-st-mask` 属性去 ack 的；主线的外设驱动完全不知道这个寄存器的存在，所以 ack 必须由 mux 自己做：
+**① Ack the status bit (W1C) before dispatching.** The vendor did this from its forked 8250 driver through an `interrupts-st-mask` property. Mainline peripheral drivers know nothing about that register, so the mux itself must ack:
 
 ```c
 +			/* Ack the mux status bit before dispatching. The
@@ -359,7 +364,7 @@ DTS 加 `rtc@600`（ISO 块）后 rtc-rtd119x probe 成功、`/dev/rtc0` 出现�
 +			spin_unlock(&irq_mux_lock);
 ```
 
-**② 热路径里所有 `printk` 全部删除。** 厂商代码在找不到 irq desc 时 `pr_err`。但 console 就骑在被 mux 的那个 uart 上——打印一行 → 产生 TX 中断 → 再进 handler → 再打印，自维持风暴（实测 150 秒 607 行）。同时把厂商那段"强清"尾巴（含 `irq == 1` 的死代码）整段删掉：
+**② Every `printk` removed from the hot path.** The vendor code calls `pr_err` when it cannot find an irq desc. But the console rides the very UART being muxed: print one line → TX interrupt → re-enter the handler → print again. Measured at 607 lines in 150 s. The vendor's "force clear" tail (including dead code for `irq == 1`) was deleted along with it:
 
 ```c
 +			/* NEVER printk in this handler: the console may
@@ -372,44 +377,44 @@ DTS 加 `rtc@600`（ISO 块）后 rtc-rtd119x probe 成功、`/dev/rtc0` 出现�
 +			 */
 ```
 
-**Kconfig 侧**：驱动文件其实一度已在树里、Makefile 也有，但 prompt 被 `if COMPILE_TEST` 门住，`CONFIG_IRQ_RTD129X_MUX` 这个符号在 `.config` 里根本不存在，驱动从未被链接。去掉这个门是让它生效的**前提**。
+**On the Kconfig side**: the driver file and its Makefile entry were already present, but the prompt was gated behind `if COMPILE_TEST`, so `CONFIG_IRQ_RTD129X_MUX` did not exist in `.config` and the driver was never linked. Removing that gate is the precondition for any of this working.
 
 ---
 
-### 4.3 `drivers/net/ethernet/realtek/r8169soc.c` — 以太网
+### 4.3 `drivers/net/ethernet/realtek/r8169soc.c` — ethernet
 
-主线没有 RTD1295 GMAC 驱动。厂商的 `r8169soc.c` 是 r8169 的 platform 变体（8,897 行）。本树 8,903 行，**相对厂商原版只有 450 行差异**——近乎逐字搬运。
+Mainline has no RTD1295 GMAC driver. The vendor's `r8169soc.c` is a platform variant of r8169 (8,897 lines). This tree has 8,903 lines and differs from the vendor original by **only 450 lines** — a near-verbatim carry-over.
 
-差异集中在四类，全部是 4.9 → 6.18 的 API 迁移：
+The differences fall into four categories, all 4.9 → 6.18 API migration:
 
-| 类别 | 出现次数 | 说明 |
+| Category | Occurrences | Notes |
 |---|---:|---|
-| `rtl_clk_get_optional` 替换裸 `clk_get` | 23 | 见下 |
-| `ethtool_link_ksettings` 系列 | 4 | 旧 `ethtool_cmd` 接口已删除 |
-| `netif_napi_add` 签名变化 | 1 | 6.x 去掉了 weight 参数 |
-| `eth_hw_addr` / MAC 设置 | 1 | `dev->dev_addr` 变只读 |
+| `rtl_clk_get_optional` replacing bare `clk_get` | 23 | see below |
+| `ethtool_link_ksettings` family | 4 | the old `ethtool_cmd` interface was removed |
+| `netif_napi_add` signature | 1 | the weight argument is gone in 6.x |
+| `eth_hw_addr` / MAC assignment | 1 | `dev->dev_addr` became read-only |
 
-**最重要的一处是时钟**。RTD129x **没有主线时钟驱动**，时钟门是 bootloader 留下的状态。厂商代码里到处是 `clk_get`，在主线上这些调用返回 `ERR_PTR`，一旦流进 `__clk_is_enabled` 就是 Oops → panic（这正是 v35 崩溃的原因，当时 4 月适配漏了两处裸 `clk_get`）。
+**Clocks are the important one.** RTD129x has **no mainline clock driver**; the clock gates are whatever state the bootloader left them in. Vendor code calls `clk_get` everywhere, and on mainline those calls return `ERR_PTR`. The moment one reaches `__clk_is_enabled`, it oopses and panics — which is exactly what happened in v35, where two bare `clk_get` calls had been missed during the April adaptation.
 
-统一改成 `rtl_clk_get_optional` helper：拿不到时钟时返回 **NULL**（而不是 ERR_PTR），驱动走"直接寄存器 bring-up"分支。23 处调用点全部收敛到这个 helper，避免再漏。
+All of them now funnel through an `rtl_clk_get_optional` helper that returns **NULL** rather than an ERR_PTR when no clock is available, which routes the driver into its direct-register bring-up path. Consolidating all 23 call sites onto one helper is what makes "we did not miss any" checkable.
 
-**Kconfig 门**：`NET_VENDOR_REALTEK depends on PCI || (PARPORT && X86)`。这块 SoC 没有 PCI，所以整个 Realtek 网卡子菜单都进不去，`R8169SOC` 自然也选不上。加 `|| ARCH_REALTEK` 解决。DTS 里 gmac 节点的 compatible 是 `"Realtek,r8168"`。
+**The Kconfig gate**: `NET_VENDOR_REALTEK depends on PCI || (PARPORT && X86)`. This SoC has no PCI, so the entire Realtek networking submenu was unreachable and `R8169SOC` could never be selected. Adding `|| ARCH_REALTEK` fixes it. The gmac node's compatible in the DTS is `"Realtek,r8168"`.
 
-已知无害噪声：`rtl_csiar_cond` 超时告警会打两次，是厂商驱动在这颗 SoC 上的固有现象，不影响功能。
+Known harmless noise: `rtl_csiar_cond` logs two timeout warnings. It is inherent to this vendor driver on this SoC and does not affect operation.
 
 ---
 
 ### 4.4 `drivers/usb/dwc3/dwc3-rtk.c` — USB
 
-**主线其实全家都在**：`dwc3-rtk` glue、`phy-rtk-usb2`/`phy-rtk-usb3`（都带 rtd1295 compatible）、dwc3 core 里也内置了 RTD 的 globals-offset quirk。所以 USB 的工作**不是写驱动，是配 DTS + 补两个 bootloader 遗留状态**。
+**Mainline already has the whole family**: the `dwc3-rtk` glue, `phy-rtk-usb2` and `phy-rtk-usb3` (both carrying rtd1295 compatibles), and the RTD globals-offset quirk inside dwc3 core. USB work here was therefore **device-tree configuration plus two leftover bootloader states**, not driver writing.
 
-三步踩坑与结论：
+Three problems and their conclusions:
 
-1. 裸 `snps,dwc3` 节点会报 `-EBUSY`、资源区间倒挂——主线 dwc3 把 globals 硬编码在 0xc100，RTD1295 实为 **0x8100**。**解法不是打补丁，是父节点用 compatible `realtek,rtd-dwc3`** 去触发内置 quirk。
-2. wrapper 架构对了以后 probe 读 GSNPSID 仍是垃圾——`clk_en_usb`（CRT `0x9800000c` bit4）**bootloader 默认关闭**。
-3. 链路只到 High-Speed——Type-C lane switch（`0x9801334c`）**复位值是"断开"**，尽管物理口是固定 Type-A。
+1. A bare `snps,dwc3` node reports `-EBUSY` with an inverted resource range — mainline dwc3 hardcodes globals at 0xc100, the RTD1295 has them at **0x8100**. **The fix is not a patch**: give the parent node the compatible `realtek,rtd-dwc3` to trigger the built-in quirk.
+2. With the wrapper structure correct, probe still read garbage from GSNPSID — `clk_en_usb` (CRT `0x9800000c` bit 4) is **closed by bootloader default**.
+3. The link only reached High-Speed — the Type-C lane switch (`0x9801334c`) **resets to "disconnected"**, despite the port being a fixed Type-A.
 
-后两条在 probe 里一次性解决（幂等，同一段代码块）：
+The last two are handled once, idempotently, in probe:
 
 ```c
 +	/* RTD1295: no mainline clock driver exists for the CRT gates and the
@@ -434,17 +439,17 @@ DTS 加 `rtc@600`（ISO 块）后 rtc-rtd119x probe 成功、`/dev/rtc0` 出现�
 +	}
 ```
 
-寄存器配方出处：厂商 `rtk_usb_rtd129x.c` 的 `TYPE_C_EN_SWITCH BIT(29)` 与 `TYPE_C_TxRX_sel BIT(28)|BIT(27)`。
+Register recipe from the vendor's `rtk_usb_rtd129x.c`: `TYPE_C_EN_SWITCH BIT(29)` and `TYPE_C_TxRX_sel BIT(28)|BIT(27)`.
 
-**这两处是明确的临时 quirk**：正道是写一个真正的 RTD129x clock driver，届时 `clk_en_usb` 应该由时钟框架管理。
+**Both of these are explicitly temporary quirks.** The proper fix is a real RTD129x clock driver, after which `clk_en_usb` should be owned by the clock framework.
 
-另外，物理 USB-A 口挂在 **DRD 块**上（厂商跑 adb gadget 用软件切角色，u2host/u3host 是空焊盘），DTS 里要把 DRD 按 host 使能；VBUS 由 initramfs 拉高 misc-gpio19。
+Separately, the physical USB-A port is on the **DRD block** (the vendor ran an adb gadget with a software role switch; u2host/u3host are unpopulated pads), so the DTS enables DRD in host mode, and the initramfs raises VBUS through misc-gpio19.
 
 ---
 
-### 4.5 `drivers/watchdog/rtd119x_wdt.c` — 软重启
+### 4.5 `drivers/watchdog/rtd119x_wdt.c` — soft reboot
 
-主线已有 `rtd119x_wdt`（覆盖 RTD129x），但没实现 `.restart`。本固件**没有 PSCI**，`reboot` 只会把机器停住。看门狗是唯一可用的 SoC 复位通道：
+Mainline already has `rtd119x_wdt` (it covers RTD129x), but without a `.restart` implementation. This firmware has **no PSCI**, so `reboot` merely halts the machine. The watchdog is the only usable SoC reset:
 
 ```c
 +static int rtd119x_wdt_restart(struct watchdog_device *wdev,
@@ -467,16 +472,16 @@ DTS 加 `rtc@600`（ISO 块）后 rtc-rtd119x probe 成功、`/dev/rtc0` 出现�
 +	watchdog_set_restart_priority(&data->wdt_dev, 192);
 ```
 
-优先级 192 是为了盖过任何默认 restart handler。实测 `systemctl reboot` 34 秒下线→上线。
+Priority 192 ensures it beats any default restart handler. Measured: `systemctl reboot` takes 34 s from down to back up.
 
 ---
 
-### 4.6 `drivers/thermal/rtd129x_thermal.c` — 温度传感（新写）
+### 4.6 `drivers/thermal/rtd129x_thermal.c` — thermal sensor (new)
 
-厂商驱动 83 行，本驱动 79 行，但**基本是重写**（相对厂商 144 行差异）——因为 6.x 的 thermal_of 框架和 4.9 完全不同。核心只有两件事：
+The vendor driver is 83 lines and this one is 79, but it is **essentially a rewrite** (144 diff lines against the vendor), because the 6.x thermal_of framework bears no resemblance to 4.9's. Only two things matter:
 
-- **arm 序列**：向 CTRL2（基址 + 0x08）依次写 `0x01904001`、`0x01924001`；
-- **读数**：STATUS1（基址 + 0x18）取低 18 位，**符号扩展后 × 1000 / 1024 = m°C**。
+- **Arm sequence**: write `0x01904001` then `0x01924001` to CTRL2 (base + 0x08);
+- **Reading**: take the low 18 bits of STATUS1 (base + 0x18), **sign-extend, then × 1000 / 1024 to get m°C**.
 
 ```c
 static int rtd129x_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
@@ -491,38 +496,38 @@ static int rtd129x_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 }
 ```
 
-注册用 `devm_thermal_of_zone_register()`，DTS 侧提供 `thermal-sensor@1d150` 节点和根级 `thermal-zones`（105°C critical trip）。
+Registration uses `devm_thermal_of_zone_register()`; the DTS provides a `thermal-sensor@1d150` node and a root-level `thermal-zones` with a 105 °C critical trip.
 
-**找地址的经验**：传感器在 `scpu_wrapper 0x9801d000 + 0x150`。第一次按 CRT+0x150 猜，读回 `0xDEADBEEF`——这是 RBUS 对无效区域的标志性回读，**可以当作"地址猜错了"的可靠信号**。
+**A note on finding the address**: the sensor is at `scpu_wrapper 0x9801d000 + 0x150`. The first guess of CRT+0x150 read back `0xDEADBEEF` — RBUS's signature response for an invalid region, which makes a **reliable "you have the wrong address" signal** during exploration.
 
 ---
 
-### 4.7 `drivers/soc/realtek/rtk-memory-remap.c` — 保留内存语义
+### 4.7 `drivers/soc/realtek/rtk-memory-remap.c` — reserved-memory semantics
 
-厂商 DTS 用一种非上游的 reserved-memory 绑定：
+The vendor RTD129x trees use a non-upstream reserved-memory binding:
 
 ```dts
 compatible = "rsvmem-remap";
 save_remap_name = "rbus" | "common" | "ringbuf";
 ```
 
-主线不认识它。本文件（100 行，厂商原版 245 行，差异 313 行 → 大幅重写）保留这个语义，让厂商 DTS 的保留内存描述继续有效。文件头注释写明了它的性质：
+Mainline does not know it. This file (100 lines; the vendor original is 245, with 313 diff lines — a heavy rewrite) keeps those semantics working. Its header comment states what it is:
 
 > This is *not* an upstream binding. It's here to keep the vendor DTS semantics working while porting WD My Cloud Home (RTD1295) to 6.x.
 
-⚠️ 与之相关的一个**大坑**：厂商 DTS 里的 `rsvmem-remap` 节点 `rbus@98000000` 圈了 `0x98000000–0x981fffff`，把 SATA 控制器的 MMIO 一起包进去了，导致 AHCI 探测 `-EBUSY`。板级 DTS 里必须删掉**所有** `rsvmem-remap` 节点——保留驱动是为了兼容语义，不是为了在这块板子上使用它。
+⚠️ A **major related trap**: the vendor DTS `rsvmem-remap` node `rbus@98000000` claims `0x98000000–0x981fffff`, which swallows the SATA controller's MMIO and makes AHCI probe fail with `-EBUSY`. The board DTS must delete **all** `rsvmem-remap` nodes. Keeping the driver is about staying compatible with the binding, not about using it on this board.
 
-配套的 `include/linux/soc/realtek/rtk_rsvmem.h`（11 行）是**本项目自写**的 API 头，厂商树里没有对应文件。
+The companion `include/linux/soc/realtek/rtk_rsvmem.h` (11 lines) was **written for this port**; there is no vendor counterpart.
 
 ---
 
-### 4.8 设备树
+### 4.8 Device tree
 
-**`arch/arm64/boot/dts/realtek/rtd1295-wd-mycloud-home.dts`（新增，514 行）**
+**`arch/arm64/boot/dts/realtek/rtd1295-wd-mycloud-home.dts` (new, 514 lines)**
 
-主线**没有**这块板子（主线的 rtd1295 板级 dts 都是 35 行左右的琐碎文件，只有 memory 节点 + uart 使能）。本文件基于俄语论坛的第三方 Debian 设备树，从 4.9.330 移植而来，自包含地建立在主线 `rtd1295.dtsi` 之上。
+Mainline does **not** have this board (its rtd1295 board files are ~35-line stubs with a memory node and uart enables). This file derives from a third-party Debian device tree published on a Russian forum, was ported from 4.9.330, and is self-contained on top of mainline's `rtd1295.dtsi`.
 
-节点清单（按行号）：
+Node inventory, by line:
 
 ```
 28  memory@0 (1 GiB)          45  reserved-memory (linux,cma / ramoops@22000000)
@@ -531,13 +536,13 @@ save_remap_name = "rbus" | "common" | "ringbuf";
 205 sata_phy@3ff00                        219 sata@3f000 (AHCI)
 256 usb2phy_u2/u3, usb3phy_u3             281 usb2phy_drd/usb3phy_drd
 275 soc_thermal: thermal-sensor@1d150
-293/320/347 usb wrapper + dwc3 子节点 usb@20000/29000/1f0000
+293/320/347 usb wrappers + dwc3 children usb@20000/29000/1f0000
 371 gmac: ethernet@16000 ("Realtek,r8168")
-393 &uart0/1/2                            417 &cpu0..&cpu3（spin-table release addr）
-489 thermal-zones (soc-crit 105°C)        507 &iso { rtc@600 }
+393 &uart0/1/2                            417 &cpu0..&cpu3 (spin-table release addresses)
+489 thermal-zones (soc-crit 105 C)        507 &iso { rtc@600 }
 ```
 
-**`arch/arm64/boot/dts/realtek/rtd129x.dtsi`（修改，仅 1 行实质变更）**
+**`arch/arm64/boot/dts/realtek/rtd129x.dtsi` (modified, one substantive line)**
 
 ```diff
  		rbus: bus@98000000 {
@@ -548,211 +553,213 @@ save_remap_name = "rbus" | "common" | "ringbuf";
  			ranges = <0x0 0x98000000 0x200000>;
 ```
 
-删掉 `reg` 属性。`simple-bus` 节点带 `reg` 会把整个 2 MiB 窗口登记为已占用资源，让挂在它下面的子设备（SATA 等）请求自己那段 MMIO 时撞上 `-EBUSY`。`ranges` 保留即可完成地址翻译。
+Removing `reg` matters because a `simple-bus` node carrying `reg` registers the whole 2 MiB window as a claimed resource, so child devices underneath it (SATA among them) hit `-EBUSY` when requesting their own MMIO. `ranges` alone is sufficient for address translation.
 
-**厂商参考 DTS**：`.../rtd129x/rtd-1295-monarch-1GB.dts`（318 行，include `rtd-1295-giraffe-common.dtsi`）。它是"在 giraffe 公共 dtsi 上打差量"的结构，而本树的 DTS 是自包含建立在主线 dtsi 上的，所以两者直接 diff 参考价值有限——移植时是按硬件块逐个翻译，而不是文本对照。
+**Vendor reference DTS**: `.../rtd129x/rtd-1295-monarch-1GB.dts` (318 lines, including `rtd-1295-giraffe-common.dtsi`). It is structured as a delta on a shared giraffe dtsi, whereas ours is self-contained on mainline's dtsi, so a direct textual diff between the two is of limited value — the port proceeded hardware block by hardware block, not by text comparison.
 
 ---
 
-### 4.9 编成模块但未加载的部分：I2C / PMIC / Regulator
+### 4.9 Ported but never loaded: I2C, PMIC, regulators
 
-这一组值得单独说明，因为仓库里的旧文档 `DRIVER_PORTING_GUIDE.md` 曾断言"缺 I2C 驱动 = 严重问题，可能导致无法启动"。
+This group deserves its own section, because the older `DRIVER_PORTING_GUIDE.md` in this repository claimed that a missing I2C driver was a severe problem that might prevent boot.
 
-**事实是**：这些驱动**已经移植进树**——
+**The drivers are in fact present in the tree**:
 
-| 文件 | 行数 | vs 厂商 |
+| File | Lines | vs vendor |
 |---|---:|---:|
 | `drivers/i2c/busses/i2c-rtk.c` | 983 | 211 |
 | `drivers/mfd/g2227-i2c.c` | 133 | 26 |
-| `drivers/mfd/g22xx-core.c` | 43 | 0（逐字节相同） |
+| `drivers/mfd/g22xx-core.c` | 43 | 0 (byte-identical) |
 | `include/linux/mfd/g2227.h` / `g22xx.h` | 197 / 27 | 0 / 0 |
 | `drivers/regulator/g2227-regulator.c` | 196 | 0 |
-| `drivers/regulator/g22xx-regulator-core.c` | 342 | 72（新 regulator API） |
+| `drivers/regulator/g22xx-regulator-core.c` | 342 | 72 (new regulator API) |
 | `drivers/regulator/g22xx-regulator.h` | 71 | 0 |
 | `include/dt-bindings/regulator/gmt,g22xx.h` | 27 | 0 |
 
-它们在 `.config` 里全部是 **`=m`**（全配置只有 9 个 `=m`，基本就是这一组），而**设备上 `/lib/modules` 目录根本不存在、已加载模块数为 0**。也就是说：
+All of them are **`=m`** in `.config` (the whole configuration has only nine `=m` symbols, essentially this group), and on the device **`/lib/modules` does not exist and zero modules are loaded**. In other words:
 
-> **这套 I2C + GMT G2227 PMIC + regulator 栈被移植、被编译，但从未安装也从未加载。设备完全靠内建驱动运行，regulator 全部回落到 dummy。**
+> **This I2C + GMT G2227 PMIC + regulator stack was ported and compiled, but never installed and never loaded. The device runs entirely on built-in drivers, and every regulator falls back to dummy.**
 
-所以旧文档那个论断**在实践中被证伪**了——设备不带这套驱动照常启动、跑满负载、对外发布。但也不能反过来说"没移植"：代码在树里，DTS 也实例化了 `pmic@12`，只要 `=y` 重编或把模块装上就能启用。
+So the old claim is disproven in practice — but it would be equally wrong to say the drivers were never ported. The code is in the tree, the DTS instantiates `pmic@12`, and switching the symbols to `=y` and rebuilding would enable it.
 
-**留着它们的理由**：这是把电源管理做完整（动态调压、精确掉电控制）的现成起点，没必要因为暂时用不上就删掉。
+**Why keep them**: they are a ready-made starting point for proper power management (dynamic voltage scaling, precise power sequencing). There is no reason to delete working ported code just because it is currently unused.
 
-### 4.10 `drivers/phy/realtek/phy-rtk-sata.c` — 别把它和上面一组混为一谈
+### 4.10 `drivers/phy/realtek/phy-rtk-sata.c` — do not confuse this with the group above
 
-SATA PHY 是 **`=y`，内建，且真在工作**——启动盘就挂在它下面：
+The SATA PHY is **`=y`, built in, and actively working** — the boot disk hangs off it:
 
 ```
 phy-rtk-sata 9803ff00.sata-phy: rtk-sata-phy: init phy0 OK
 ```
 
-431 行，厂商原版 677 行（在 4.9 树里路径是 `drivers/phy/phy-rtk-sata.c`，还没有 `realtek/` 子目录），差异 809 行——**大幅重写并精简**，用上了 `devm_platform_ioremap_resource`、`devm_kcalloc`、现代 `struct phy_ops` / `phy_provider` 框架。
+431 lines here against a 677-line vendor original (which lived at `drivers/phy/phy-rtk-sata.c` — 4.9 had no `realtek/` subdirectory), with 809 diff lines: **heavily rewritten and slimmed**, using `devm_platform_ioremap_resource`, `devm_kcalloc`, and the modern `struct phy_ops` / `phy_provider` framework.
 
-顺带说明日志里那三行 `supply ahci/phy/target not found, using dummy regulator` 是正常的——正是 §4.9 那套 regulator 没加载的结果，AHCI 用 dummy regulator 照常工作。
+Incidentally, the three `supply ahci/phy/target not found, using dummy regulator` lines in the boot log are expected — they are a direct consequence of the §4.9 regulator stack not being loaded. AHCI works fine on dummy regulators.
 
 ---
 
-## 5. 配置片段
+## 5. Configuration fragments
 
-仓库里保留了 16 个 `rtd1295_*.config` 片段。**它们已经全部折叠进入库的 `.config`，不再是构建输入**（构建脚本只在构建目录里设 `INITRAMFS_SOURCE` 一项）。保留它们是为了说明"每一组选项分别为了解决什么问题"：
+The repository keeps 16 `rtd1295_*.config` fragments. **They have all been folded into the tracked `.config` and are no longer build inputs** (the build script only sets `INITRAMFS_SOURCE` in the build directory). They are kept as documentation of *why each group of options exists*:
 
-| 片段 | 解决的问题 |
+| Fragment | Problem it solves |
 |---|---|
-| `rtd1295_minimal.config` / `_size.config` | 体积控制（`CONFIG_SYS_BOOTM_LEN` 约 20 MB 上限，见 §1.4） |
-| `rtd1295_cmdline.config` / `_cmdline_fix.config` | `CMDLINE_FORCE` + 写死 earlycon/console（§2.1-③） |
-| `rtd1295_compat32.config` | `CONFIG_COMPAT=y`，32 位厂商用户态 |
-| `rtd1295_mdraid.config` | md RAID1（根文件系统在 md1 上） |
-| `rtd1295_initramfs_fix.config` | 内嵌 initramfs 相关 |
-| `rtd1295_systemd.config` | cgroups 全家 / SYSVIPC / POSIX_MQUEUE / TMPFS ACL / AUTOFS —— 缺了 systemd 直接冻结（§2.2-⑧） |
+| `rtd1295_minimal.config` / `_size.config` | Size control (the ~20 MB `CONFIG_SYS_BOOTM_LEN` ceiling, §1.4) |
+| `rtd1295_cmdline.config` / `_cmdline_fix.config` | `CMDLINE_FORCE` plus a hardcoded earlycon/console (§2.1-③) |
+| `rtd1295_compat32.config` | `CONFIG_COMPAT=y` for 32-bit vendor userspace |
+| `rtd1295_mdraid.config` | md RAID1 (the root filesystem lives on md1) |
+| `rtd1295_initramfs_fix.config` | Embedded initramfs options |
+| `rtd1295_systemd.config` | cgroups family, SYSVIPC, POSIX_MQUEUE, TMPFS ACL, AUTOFS — without these systemd simply freezes (§2.2-⑧) |
 | `rtd1295_irqmux.config` | `IRQ_RTD129X_MUX=y` |
-| `rtd1295_ethernet.config` | `R8169SOC=y` + `NET_VENDOR_REALTEK=y` |
-| `rtd1295_usb.config` | dwc3 / phy-rtk |
-| `rtd1295_thermal.config` | 温度传感 |
-| `rtd1295_docker.config` | netfilter 双栈（nft + legacy）、**IPv6**（瘦身配置里整个没有）、veth/bridge/macvlan/vlan、cgroup-bpf、user-ns、overlayfs、blk-throttle、CFS bandwidth |
-| `rtd1295_nas.config` | NFSD v4、ext4 ACL/xattr、配额、TUN/WireGuard、DM+crypt、FUSE、vfat/exfat/ntfs3/CIFS、zram、看门狗、RTC class |
-| `CONFIG_VENDOR_RTSDK_*.config` | 厂商 SDK 对照参考 |
+| `rtd1295_ethernet.config` | `R8169SOC=y` plus `NET_VENDOR_REALTEK=y` |
+| `rtd1295_usb.config` | dwc3 and phy-rtk |
+| `rtd1295_thermal.config` | Thermal sensor |
+| `rtd1295_docker.config` | Dual netfilter stacks (nft + legacy), **IPv6** (entirely absent from the trimmed config), veth/bridge/macvlan/vlan, cgroup-bpf, user namespaces, overlayfs, blk-throttle, CFS bandwidth |
+| `rtd1295_nas.config` | NFSD v4, ext4 ACL/xattr, quotas, TUN/WireGuard, DM+crypt, FUSE, vfat/exfat/ntfs3/CIFS, zram, watchdog, RTC class |
+| `CONFIG_VENDOR_RTSDK_*.config` | Vendor SDK reference for comparison |
 
-6.18 上的三个具体踩点：legacy iptables 表要同时开 `IP_NF_IPTABLES_LEGACY` + `NETFILTER_XTABLES_LEGACY`（trixie 的 iptables 默认走 nft 后端，但 docker 仍可能用 legacy）；`VETH` 依赖 `NET_CORE`；`NF_TABLES_INET` 依赖 `IPV6`。
+Three specific 6.18-era gotchas: legacy iptables tables need both `IP_NF_IPTABLES_LEGACY` and `NETFILTER_XTABLES_LEGACY` (trixie's iptables defaults to the nft backend, but Docker may still reach for legacy); `VETH` depends on `NET_CORE`; `NF_TABLES_INET` depends on `IPV6`.
+---
 
-## 6. 构建与打包流程
+## 6. Build and packaging
 
-构建脚本：`rebuild_package_and_print_flash.sh`（约 380 行）。默认目标内核 6.18.40，发布名可用 `--release` 指定。
+The build script is `rebuild_package_and_print_flash.sh` (about 380 lines). It targets 6.18.40 by default; the release name is set with `--release`.
 
-它做的事，按阶段：
+What it does, by stage:
 
-**预检。** 要求内核 Makefile、已入库的 `.config`、`initramfs/init`、基准 fw_table（必须恰好 8192 字节）、以及发布目录里的 README/SOURCES/docs/tools 都已就位。备份源码树的 `.config`（EXIT trap 恢复），拷进构建目录。
+**Preflight.** Requires the kernel Makefile, the tracked `.config`, `initramfs/init`, the base fw_table (which must be exactly 8192 bytes), and the release directory's README/SOURCES/docs/tools to already be in place. Backs up the source tree's `.config` (restored by an EXIT trap) and copies it into the build directory.
 
-**[0/5] 配置装配。** 先 `make mrproper`（out-of-tree 构建会拒绝在残留产物的源码树上跑），然后：
+**[0/5] Config assembly.** `make mrproper` first (an out-of-tree build refuses to run against a source tree with leftover build products), then:
 
 ```sh
 scripts/config --file build/.config --set-str INITRAMFS_SOURCE "$ROOT_DIR/initramfs"
 ```
 
-⚠️ **这是唯一在此处合并的片段**——历史上的 `rtd1295_*.config` 片段早已折叠进入库的 `.config`。片段文件保留在仓库里是**为了说明每组选项为什么存在**（见 §5），不是构建输入。
+⚠️ **That is the only fragment merged at this point** — the historical `rtd1295_*.config` fragments were folded into the tracked `.config` long ago. They remain in the repository to document *why each group of options exists* (§5), not as build inputs.
 
-**[1/5]** `olddefconfig`。
+**[1/5]** `olddefconfig`.
 
-**[2/5] 编译。** `O=$BUILD_DIR` out-of-tree 构建 `Image dtbs`，并钉死 `KBUILD_BUILD_TIMESTAMP=@$SOURCE_DATE_EPOCH`、`KBUILD_BUILD_USER`、`KBUILD_BUILD_HOST`——为了可复现构建。`SOURCE_DATE_EPOCH` 默认取当前 git 提交的时间戳。
+**[2/5] Compile.** Out-of-tree (`O=$BUILD_DIR`) build of `Image dtbs`, with `KBUILD_BUILD_TIMESTAMP=@$SOURCE_DATE_EPOCH`, `KBUILD_BUILD_USER` and `KBUILD_BUILD_HOST` pinned for reproducibility. `SOURCE_DATE_EPOCH` defaults to the current git commit's timestamp.
 
-**[3/5] 打包**（内嵌 Python）：
+**[3/5] Packaging** (embedded Python):
 
-1. 校验 arm64 魔数（偏移 56 = `0x644D5241`）和 FDT 魔数（`0xD00DFEED`）；
-2. 改 Image 头三字段（§1.3）；
-3. Image 零填充到 4 KiB 边界；
-4. DTB 零填充到恰好 `0x7000`，**并改写大端 FDT `totalsize` 为 `0x7000`**（§1.5）；
-5. 算附加校验和（`sum(bytes) & 0xFFFFFFFF`）；
-6. 在基准 fw_table 的 `0x1A0+14/+18/+22` 和 `0x260+14/+18/+22` 写入新的大小与校验和，重算头部校验和 `sum(fw[0x0A:]) & 0xFFFF` 存回偏移 8；
-7. 输出 `BUILD-METADATA.json`（原始/补齐字节数、`sata_blocks = bytes/512`、附加校验和、sha256、源码提交）。
+1. Validate the arm64 magic (offset 56 = `0x644D5241`) and the FDT magic (`0xD00DFEED`);
+2. Patch the three Image header fields (§1.3);
+3. Zero-pad the Image to a 4 KiB boundary;
+4. Zero-pad the DTB to exactly `0x7000` **and rewrite the big-endian FDT `totalsize` to `0x7000`** (§1.5);
+5. Compute additive checksums (`sum(bytes) & 0xFFFFFFFF`);
+6. Write the new sizes and checksums into the base fw_table at `0x1A0+14/+18/+22` and `0x260+14/+18/+22`, then recompute the header checksum `sum(fw[0x0A:]) & 0xFFFF` back into offset 8;
+7. Emit `BUILD-METADATA.json` (raw and padded byte counts, `sata_blocks = bytes/512`, additive checksums, sha256 sums, source commit).
 
-同时生成 `FLASH_COMMANDS.txt`（含算好的扇区数，写序 DTB → 内核 → fw_table）和 `SHA256SUMS`。
+It also generates `FLASH_COMMANDS.txt` with the computed sector counts (write order DTB → kernel → fw_table) and `SHA256SUMS`.
 
-**[4/5] 独立复验。** 重新读回三个产物，逐字段断言 fw_table 一致、头部校验和有效、Image 4 KiB 对齐、DTB 恰好 `0x7000` 且 `totalsize == 文件长度`、RTD 头魔数存在；最后把补齐后的 DTB 用刚编出来的 `dtc` 反解析round-trip 一遍。
+**[4/5] Independent verification.** Re-reads all three artifacts and asserts every fw_table field matches, the header checksum is valid, the Image is 4 KiB aligned, the DTB is exactly `0x7000` with `totalsize == file length`, and the RTD header magic is present. Finally it round-trips the padded DTB through the `dtc` that was just built.
 
-**[5/5] 确定性归档。** `tar --sort=name --mtime=@epoch --owner=0 --group=0 --numeric-owner`，验证 Image 路径在包内，恢复源码 `.config`。实测两次独立重建产出的归档 SHA256 完全一致。
+**[5/5] Deterministic archive.** `tar --sort=name --mtime=@epoch --owner=0 --group=0 --numeric-owner`, verifies the Image path is inside the archive, and restores the source `.config`. Two independent rebuilds have been confirmed to produce byte-identical archives.
 
-**A/GOLD 条目在整个流程中原样继承**自基准表。（USB 免串口刷机包更进一步：不发整张表，而是用一个静态编译的 ARM64 `patch-fwtable` 工具从**目标机自己的**盘上表生成新表，只改 B 槽 24 个字节。）
-
----
+**A and GOLD entries are inherited untouched** from the base table throughout. (The serial-free USB flasher package goes further: rather than shipping a whole table, it uses a statically linked ARM64 `patch-fwtable` tool to derive the new table from the **target machine's own** on-disk table, changing only 24 bytes of slot B.)
 
 ---
 
-## 7. 4.9 → 6.18 API 迁移对照
+## 7. 4.9 → 6.18 API migration
 
-搬运厂商驱动时实际撞到的 API 变化，按"改动量"排序。这些是从本树 2,232 行"相对厂商原版"的差异里归纳出来的，不是通用清单。
+The API changes actually encountered while carrying vendor drivers over, ordered by how much work each caused. This is distilled from the 2,232 diff lines this tree carries against the vendor originals — it is not a generic checklist.
 
-### 7.1 时钟：最大的一类，也是最容易 Oops 的
+### 7.1 Clocks: the largest category, and the one that oopses
 
-厂商代码假定 `clk_get()` 一定成功。RTD129x 在主线上**没有时钟驱动**，所有 `clk_get` 返回 `ERR_PTR(-ENOENT)`。
+Vendor code assumes `clk_get()` always succeeds. RTD129x has **no clock driver on mainline**, so every `clk_get` returns `ERR_PTR(-ENOENT)`.
 
 ```c
-/* 厂商 4.9 写法，在主线上是定时炸弹 */
+/* vendor 4.9 idiom — a time bomb on mainline */
 clk = clk_get(dev, "name");
-if (__clk_is_enabled(clk))      /* ERR_PTR 进来 → Oops */
+if (__clk_is_enabled(clk))      /* ERR_PTR arrives here -> oops */
 ```
 
-统一收敛到一个 helper，拿不到时返回 **NULL** 而不是 ERR_PTR，让调用点用"NULL = 没有时钟框架，走直接寄存器 bring-up"这一条语义：
+Funnel everything through one helper that returns **NULL** rather than an ERR_PTR when no clock is available, giving call sites a single clear meaning: NULL means "no clock framework here, use the direct-register bring-up path".
 
 ```c
 static struct clk *rtl_clk_get_optional(struct device *dev, const char *id);
 ```
 
-`r8169soc.c` 里 23 处调用点全部走这个 helper。**教训**：这类替换必须做到"一处不漏"——v35 就是因为漏了两处裸 `clk_get` 而在 probe 里 panic。漏网的代价是整机不启动，而且现场只有一行 Oops。
+All 23 call sites in `r8169soc.c` go through it. **Lesson**: this kind of substitution has to be exhaustive. v35 panicked in probe because exactly two bare `clk_get` calls were missed, and the cost of missing one is a machine that does not boot, with a single oops line as your only evidence.
 
 ### 7.2 ethtool
 
-`struct ethtool_cmd` 及 `get_settings`/`set_settings` 已被删除，改用 link_ksettings：
+`struct ethtool_cmd` and the `get_settings`/`set_settings` callbacks were removed in favour of link_ksettings:
 
 | 4.9 | 6.18 |
 |---|---|
 | `struct ethtool_cmd` | `struct ethtool_link_ksettings` |
 | `.get_settings` / `.set_settings` | `.get_link_ksettings` / `.set_link_ksettings` |
-| 直接读写 `cmd->supported` 等 | `ethtool_convert_link_mode_to_legacy_u32()` 等转换辅助 |
+| Direct access to `cmd->supported` etc. | Conversion helpers such as `ethtool_convert_link_mode_to_legacy_u32()` |
 
-### 7.3 网络设备
+### 7.3 Network devices
 
 | 4.9 | 6.18 |
 |---|---|
-| `netif_napi_add(dev, napi, poll, weight)` | `netif_napi_add(dev, napi, poll)`（weight 参数已去掉） |
-| `memcpy(dev->dev_addr, ...)` | `dev->dev_addr` 变只读，须用 `eth_hw_addr_set()` |
+| `netif_napi_add(dev, napi, poll, weight)` | `netif_napi_add(dev, napi, poll)` — the weight argument is gone |
+| `memcpy(dev->dev_addr, ...)` | `dev->dev_addr` is read-only; use `eth_hw_addr_set()` |
 
-### 7.4 platform / resource 样板
+### 7.4 platform / resource boilerplate
 
-现代 devm 辅助函数大幅缩短了 probe 代码，`phy-rtk-sata.c` 从 677 行精简到 431 行主要靠这个：
+Modern devm helpers shorten probe code considerably; this is most of why `phy-rtk-sata.c` went from 677 lines to 431:
 
-| 4.9 常见写法 | 6.18 |
+| Common 4.9 idiom | 6.18 |
 |---|---|
 | `platform_get_resource` + `devm_ioremap_resource` | `devm_platform_ioremap_resource()` |
-| 手写数组分配 | `devm_kcalloc()` |
-| `of_property_read_u32` 逐个数数 | `of_property_count_u32_elems()` 等 |
+| Hand-rolled array allocation | `devm_kcalloc()` |
+| Counting properties with repeated `of_property_read_u32` | `of_property_count_u32_elems()` and friends |
 
 ### 7.5 thermal
 
-4.9 的 thermal 注册方式与 6.x 差异太大，`rtd129x_thermal.c` 属于**照着寄存器协议重写**而不是移植：
+4.9's thermal registration differs so much from 6.x that `rtd129x_thermal.c` was **rewritten against the register protocol** rather than ported:
 
 | 4.9 | 6.18 |
 |---|---|
-| 自建 `thermal_zone_device_register` + 私有 ops | `devm_thermal_of_zone_register()` |
-| ops 回调签名带私有 struct | `.get_temp(struct thermal_zone_device *tz, int *temp)` + `thermal_zone_device_priv()` |
+| Hand-rolled `thermal_zone_device_register` with private ops | `devm_thermal_of_zone_register()` |
+| Callbacks taking a private struct | `.get_temp(struct thermal_zone_device *tz, int *temp)` plus `thermal_zone_device_priv()` |
 
-从厂商驱动里真正需要提取的只有两条硬件知识：arm 序列的两个魔数，和 18 位符号扩展 × 1000/1024 的换算。
+Only two pieces of hardware knowledge actually had to be extracted from the vendor driver: the two arm-sequence magic values, and the 18-bit sign-extension × 1000/1024 conversion.
 
 ### 7.6 regulator
 
-`g22xx-regulator-core.c` 相对厂商 72 行差异，主要是 of 解析辅助的变化（`of_property_read_bool` / `of_get_child_by_name` 等）与 regulator 框架结构体字段调整。
+`g22xx-regulator-core.c` differs from the vendor by 72 lines, mostly changes to OF parsing helpers (`of_property_read_bool`, `of_get_child_by_name`) and adjustments to regulator framework structures.
 
 ### 7.7 irqchip
 
-厂商 irq mux 的核心逻辑（读状态、查 enable、分发）在 6.18 上基本可以照搬，`generic_handle_irq` / `irq_find_mapping` / `irq_desc_get_irq` 都还在。真正需要改的不是 API，而是**语义责任的转移**：厂商靠 fork 的 8250 驱动 ack 状态位，主线外设驱动不知道这个寄存器，所以 ack 责任必须搬进 mux（§4.2）。
+The core logic of the vendor IRQ mux — read status, check enable, dispatch — carries over to 6.18 almost unchanged; `generic_handle_irq`, `irq_find_mapping` and `irq_desc_get_irq` all still exist. What actually had to change was not an API but **a transfer of responsibility**: the vendor acked the status register from its forked 8250 driver, and mainline peripheral drivers know nothing about that register, so acking had to move into the mux itself (§4.2).
 
-**这是移植厂商 BSP 时最需要警惕的一类问题**：不是函数签名变了，而是厂商把某个职责分散在了它自己 fork 的其他驱动里。你只搬了一个文件，那个职责就凭空消失了。
+**This is the failure mode to watch for when porting a vendor BSP**: not that a function signature changed, but that the vendor distributed some responsibility across its own forked drivers. Port one file, and that responsibility silently disappears.
 
 ---
 
-## 8. 与仓库内其他文档的关系
+## 8. Relationship to the other documents in this repository
 
-本仓库的文档有历史层积，这里说明取代关系，避免读到过时结论。
+The documentation here accumulated in layers. Everything that this guide supersedes has been
+moved under [`docs/history/`](history/) so the repository root stays readable; nothing was
+lost, and git history has the rest. This table records what supersedes what, so nobody acts
+on an obsolete conclusion.
 
-| 文档 | 状态 | 说明 |
+| Document | Status | Notes |
 |---|---|---|
-| [README.md](README.md) | **现行** | 面向使用者：刷机、槽位边界、版本命名。本指南不重复扇区表，需要时链接过去。 |
-| [DEVELOPMENT_HISTORY.md](DEVELOPMENT_HISTORY.md) | **现行** | 里程碑编年（vNN + git SHA）。与本指南互补：它讲"何时"，本指南讲"为什么和怎么改"。 |
-| `DEBUG_SESSION_2026-04-20.md` | **史料，结论部分已被取代** | 四月引导链攻坚的一手记录，厂商 DTS 剖析仍有参考价值。但它早于所有真机验证——其中 v23 的 spin-table DTS 后来实测硬挂（原因见 §2.2-⑦）。 |
-| `PORTING_STATUS.md` | **史料** | 2026-04-19 快照。"已完成"部分的事实（Image 头数值、COMPAT、rsvmem、switch_root 决策）准确，但状态与下一步框架早于 SMP/UART/网络/USB/thermal 全部完成。 |
-| `KERNEL_PORTING_GUIDE.md` | **被本文取代** | 冻结在 6.18.2 时期。其中 DT 新旧格式转换的操作方法仍有效，其余状态描述已废。 |
-| `DRIVER_PORTING_GUIDE.md` | **被本文取代（且结论有误）** | 其核心论断"缺 I2C 驱动 = 严重问题，可能导致无法启动"**已被实践否定**：I2C/PMIC 栈虽已移植进树，但编成模块且从未加载，设备照常启动、运行、发布（详见 §4.9）。特此写明，以免有人重新捡起这个结论。 |
-| `OFFICIAL_KERNEL_ANALYSIS.md` | **被本文取代（部分史料有用）** | 其中厂商 DTS 的 include 层次（`rtd-1295-monarch-1GB.dts` → giraffe-common → `rtd-1295.dtsi`）、厂商 bootargs、gmac/PWM 节点记录是准确的 4.9 树参考；前瞻性分析部分已废。 |
+| [`README.md`](../README.md) | **Current** | User-facing: flashing, slot boundaries, version naming. This guide does not restate the sector tables; it links here. |
+| [`DEVELOPMENT_HISTORY.md`](../DEVELOPMENT_HISTORY.md) | **Current** | Milestone chronology (vNN plus git SHAs). Complementary: it covers *when*, this guide covers *why and how*. |
+| [`history/DEBUG_SESSION_2026-04-20.md`](history/DEBUG_SESSION_2026-04-20.md) | **Historical; conclusions superseded** | The primary record of the April boot-chain work, and its vendor-DTS analysis is still useful. But it predates all hardware validation — notably, its v23 spin-table DTS later hard-hung on the machine (§2.2-⑦). |
+| [`history/PORTING_STATUS.md`](history/PORTING_STATUS.md) | **Historical** | A 2026-04-19 snapshot. Its "completed" facts (Image header values, COMPAT, rsvmem, the switch_root decision) are accurate, but its status and next-steps framing predates SMP, UART IRQ, ethernet, USB and thermal all being finished. |
+| [`history/KERNEL_PORTING_GUIDE.md`](history/KERNEL_PORTING_GUIDE.md) | **Superseded by this document** | Frozen in the 6.18.2 era. Its device-tree format conversion recipe is still valid; the status sections are obsolete. |
+| [`history/DRIVER_PORTING_GUIDE.md`](history/DRIVER_PORTING_GUIDE.md) | **Superseded by this document, and one conclusion was wrong** | Its central claim — that a missing I2C driver is severe and might prevent boot — **is disproven in practice**: the I2C and PMIC stack is in the tree but built as modules that are never loaded, and the device boots, runs and ships without them (§4.9). Stated explicitly here so nobody revives it. |
+| [`history/OFFICIAL_KERNEL_ANALYSIS.md`](history/OFFICIAL_KERNEL_ANALYSIS.md) | **Superseded by this document; some reference value remains** | Its record of the vendor DTS include hierarchy (`rtd-1295-monarch-1GB.dts` → giraffe-common → `rtd-1295.dtsi`), vendor bootargs and gmac/PWM nodes is accurate as 4.9-tree reference. Its forward-looking analysis is obsolete. |
 
 ---
 
-## 9. 未完成与已知限制
+## 9. Unfinished work and known limitations
 
-| 项目 | 状态 |
+| Item | Status |
 |---|---|
-| RTC 不走针 | 主动搁置。probe 成功、`/dev/rtc0` 存在，缺厂商使能序列。NTP 已覆盖需求。 |
-| `rtl_csiar_cond` 超时告警 | 厂商驱动在此 SoC 上的已知噪声，×2 出现，不影响功能。 |
-| u2host / u3host 空根集线器 | 无害（对应物理口是空焊盘），可在 DTS 里关掉。 |
-| I2C / PMIC / regulator | 已移植进树但编成模块、从未加载；设备靠内建驱动运行，regulator 全部是 dummy。要启用改 `=y` 重编即可（§4.9）。 |
-| 板级 DTS 的 `bootargs` | 仍写着错误的 `root=/dev/sda9 rootfstype=ext4`，被 `CMDLINE_FORCE` 盖住。应顺手修掉。 |
-| A 槽 | 本机上已失效（旧 initramfs 的 switch_root 失败 → 约 43 秒 panic → 无限重启）。可考虑改造成写入本项目已验证内核的免串口回退槽。 |
-| 时钟驱动 | RTD129x 无主线时钟驱动。以太网、USB 都靠 bootloader 留下的时钟门 + probe 期 quirk 开门。写一个真正的 clock driver 是后续正道。 |
+| RTC does not tick | Deliberately shelved. It probes and `/dev/rtc0` exists, but the vendor enable sequence is missing. NTP covers the requirement. |
+| `rtl_csiar_cond` timeout warnings | Known noise from this vendor driver on this SoC; appears twice, harmless. |
+| Empty u2host / u3host root hubs | Harmless (the corresponding ports are unpopulated pads); can be disabled in the DTS. |
+| I2C / PMIC / regulators | Ported into the tree but built as modules and never loaded; the device runs on built-in drivers with dummy regulators. Switch to `=y` and rebuild to enable (§4.9). |
+| Board DTS `bootargs` | Still contains the incorrect `root=/dev/sda9 rootfstype=ext4`, masked by `CMDLINE_FORCE`. Should be fixed. |
+| Slot A | Dead on this unit: the old initramfs fails switch_root and panic-loops after about 43 s. Could be repurposed as a serial-free fallback slot holding a validated kernel from this project. |
+| Clock driver | RTD129x has no mainline clock driver. Ethernet and USB rely on the gates the bootloader leaves open plus probe-time quirks. Writing a real clock driver is the proper path forward. |

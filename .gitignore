@@ -5,3 +5,11 @@ uImage*
 *.img
 nohup.out
 build/
+
+# build by-products that used to accumulate in the repository root
+/fw_table*.bin
+/*.dtb
+/*.dts
+/gpt_*.bin
+/mdadm-pack.tar.gz
+/*.log
