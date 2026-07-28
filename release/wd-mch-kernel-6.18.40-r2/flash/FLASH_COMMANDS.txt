@@ -1,0 +1,18 @@
+# Generated for wd-mch-kernel-6.18.40-r2 from source commit 7389699a66d120d34d87e0465bd4c84574d5d8a1
+# Confirm every TFTP byte count before running the following sata write.
+
+sata init
+env set serverip 192.168.1.100
+env set ipaddr 192.168.1.200
+
+tftp 0x04000000 mch.dtb
+sata write 0x04000000 0x31000 0x38
+
+tftp 0x04000000 Image-6.18.40-mch
+sata write 0x04000000 0x33800 0x7ee8
+
+tftp 0x04000000 fw_table.bin
+sata write 0x04000000 0x22 0x10
+
+env set bootdelay 5
+bootr

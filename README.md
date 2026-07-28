@@ -13,9 +13,9 @@ Testing has been performed on one single-bay My Cloud Home. My Cloud Home Duo
 and other RTD1295-based products are outside the tested scope.
 
 > [!IMPORTANT]
-> The hardware-tested release remains **6.18.2-r1**. The
-> **6.18.40-r2-rc1** package is a build-verified upgrade candidate and must
-> complete hardware validation before it becomes the recommended release.
+> The current release is **6.18.40-r2**, validated on hardware. The earlier
+> **6.18.2-r1** package is kept for rollback and is no longer recommended for
+> new installations.
 
 > [!WARNING]
 > Writing the wrong disk sectors can make the device unbootable. Before
@@ -28,20 +28,19 @@ and other RTD1295-based products are outside the tested scope.
 If you want to use the prebuilt kernel:
 
 1. Confirm that your device matches the supported configuration above.
-2. For a normal installation, download
-   [`wd-mch-kernel-6.18.2-r1.tar.gz`](release/wd-mch-kernel-6.18.2-r1.tar.gz).
-3. Read the [package overview](release/wd-mch-kernel-6.18.2-r1/README.md)
+2. Download
+   [`wd-mch-kernel-6.18.40-r2.tar.gz`](release/wd-mch-kernel-6.18.40-r2.tar.gz).
+3. Read the [package overview](release/wd-mch-kernel-6.18.40-r2/README.md)
    (Chinese).
-4. Follow the [flashing guide](release/wd-mch-kernel-6.18.2-r1/docs/FLASHING.md)
+4. Follow the [flashing guide](release/wd-mch-kernel-6.18.40-r2/docs/FLASHING.md)
    (Chinese).
 5. Before making changes, understand the
-   [slot-selection, rollback, and network-recovery procedures](release/wd-mch-kernel-6.18.2-r1/docs/RESCUE.md)
+   [slot-selection, rollback, and network-recovery procedures](release/wd-mch-kernel-6.18.40-r2/docs/RESCUE.md)
    (Chinese).
 
-Hardware testers evaluating Linux 6.18.40 must instead use the explicitly
-labelled
-[`r2-rc1` candidate](release/wd-mch-kernel-6.18.40-r2-rc1/README.md)
-and its generated flash commands. Do not mix files from the two packages.
+The previous [`6.18.2-r1`](release/wd-mch-kernel-6.18.2-r1/README.md) package
+remains available as a rollback target. Do not mix files from the two
+packages.
 
 If you plan to modify or port the kernel, start with
 [`docs/PORTING_GUIDE_4.9_to_6.18.md`](docs/PORTING_GUIDE_4.9_to_6.18.md) — a
@@ -59,30 +58,28 @@ instructions.
 
 | Item | Value |
 |---|---|
-| User-facing release | **r1** |
-| Upstream kernel | Linux 6.18.2 |
+| User-facing release | **r2** |
+| Upstream kernel | Linux 6.18.40 LTS |
 | Target hardware | Single-bay WD My Cloud Home / Realtek RTD1295 |
 | Target boot slot | B; A and GOLD remain untouched |
 | Root filesystem | Existing Debian 13 arm64 installation on `/dev/md1` |
-| Corresponding source | Commit `7b70fa890`, plus public-release documentation |
-| Validation | Cold boot, soft reboot, networking, and unattended SSH recovery tested on hardware |
+| Corresponding source | Commit `31ed4b309` on `main` |
+| Validation | Flashed and booted on hardware; four cores, interrupt-driven UART, ethernet, Docker, OpenMediaVault, USB 3.0, thermal zones and md array assembly all confirmed, across three cold power cycles with no failed units |
 
-Regular users should use `r1`. Do not select files by the internal `v21`,
+Regular users should use `r2`. Do not select files by the internal `v21`,
 `v38`, or `v46` labels found in old development artifacts.
 
-## Upgrade candidate
+## Previous release
 
 | Item | Value |
 |---|---|
-| Candidate package | **r2-rc1** |
-| Upstream kernel | Linux 6.18.40 LTS |
-| Development branch | `upgrade/linux-6.18.40` |
-| Build validation | Clean configuration, Image, DTB, packaging, and checksum verification passed |
-| Hardware validation | Pending |
+| Package | `r1` |
+| Upstream kernel | Linux 6.18.2 |
+| Status | Superseded by `r2`; kept as a rollback target |
 
-The candidate is an upgrade test, not a replacement for `r1` yet. Its package
-contains `BUILD-METADATA.json` and generated `FLASH_COMMANDS.txt` so that the
-source commit, artifact sizes, and B-slot write counts remain auditable.
+`r1` remains in the repository so an existing installation can be put back the
+way it was. Both packages write only the B slot, so rolling back is the same
+procedure as flashing forward.
 
 ## Version naming
 
@@ -91,8 +88,8 @@ The development log contains several unrelated numbering schemes:
 | Example | Meaning | User-selectable? |
 |---|---|---|
 | `6.18.2`, `6.18.40` | Upstream Linux kernel version | Only through a complete package |
-| `r1` | Version of the complete public flashing package | **Yes; use this release** |
-| `r2-rc1` | Hardware-test candidate for the next release | Testers only |
+| `r2` | Version of the complete public flashing package | **Yes; use this release** |
+| `r1` | The previous package, kept as a rollback target | Only to roll back |
 | `v21` through `v46` | Chronological labels for internal kernel + DTB + `fw_table` test combinations | No; traceability only |
 | Kernel `#35` | A local kernel build counter shown by `uname` | No |
 | DTB `v22` | An internal device-tree artifact revision | No |
@@ -113,7 +110,7 @@ These files form one validated set and must be used together. For a concise
 explanation of the internal milestones, see
 [`DEVELOPMENT_HISTORY.md`](DEVELOPMENT_HISTORY.md).
 
-## Hardware-verified functionality in r1
+## Hardware-verified functionality
 
 | Capability | Status |
 |---|---|
@@ -144,18 +141,16 @@ The release writes only these B-slot locations:
 |---|---:|---:|
 | `fw_table.bin` | `0x22` | `0x10` |
 | `mch.dtb` | `0x31000` | `0x38` |
-| `Image-6.18.2-mch` | `0x33800` | `0x7e60` |
+| `Image-6.18.40-mch` | `0x33800` | `0x7ee8` |
 
 Use the exact commands, backup procedure, and transfer-size checks in
-[`FLASHING.md`](release/wd-mch-kernel-6.18.2-r1/docs/FLASHING.md). Never
+[`FLASHING.md`](release/wd-mch-kernel-6.18.40-r2/docs/FLASHING.md). Never
 overwrite the A or GOLD slots; they provide independent recovery paths if the
 mainline kernel cannot boot.
 
 The first-stage bootloader does not decrement a retry counter and does not
 automatically roll back a failed slot. See
-[`RESCUE.md`](release/wd-mch-kernel-6.18.2-r1/docs/RESCUE.md) before flashing.
-The `r2-rc1` candidate has its own flashing and rescue documents and must be
-tested without committing B as the permanent slot.
+[`RESCUE.md`](release/wd-mch-kernel-6.18.40-r2/docs/RESCUE.md) before flashing.
 
 ## Repository layout
 
@@ -165,8 +160,8 @@ tested without committing B as the permanent slot.
 | `initramfs/` | Embedded BusyBox/mdadm initramfs, root handoff, and network recovery |
 | `rtd1295_*.config` | Configuration fragments for systemd, NAS, networking, USB, thermal support, and related features |
 | `rebuild_package_and_print_flash.sh` | Portable build and packaging tool that patches the Realtek Image header, pads artifacts, updates `fw_table`, and verifies the result |
-| `release/wd-mch-kernel-6.18.2-r1/` | User-facing `r1` artifacts and documentation |
-| `release/wd-mch-kernel-6.18.40-r2-rc1/` | Build-verified upgrade candidate and test documentation |
+| `release/wd-mch-kernel-6.18.40-r2/` | Current release: artifacts and documentation |
+| `release/wd-mch-kernel-6.18.2-r1/` | Previous release, kept as a rollback target |
 
 The main board-specific changes relative to unmodified Linux 6.18.40 are:
 
@@ -229,5 +224,5 @@ copying the raw build output.
 The Linux kernel and the corresponding modifications in this repository are
 licensed under GPL-2.0. The upstream baseline, vendor reference material, and
 release-to-source relationship are documented in the
-[`r1 source notes`](release/wd-mch-kernel-6.18.2-r1/SOURCES.md) and
-[`r2-rc1 source notes`](release/wd-mch-kernel-6.18.40-r2-rc1/SOURCES.md).
+[`r2 source notes`](release/wd-mch-kernel-6.18.40-r2/SOURCES.md) and
+[`r1 source notes`](release/wd-mch-kernel-6.18.2-r1/SOURCES.md).
