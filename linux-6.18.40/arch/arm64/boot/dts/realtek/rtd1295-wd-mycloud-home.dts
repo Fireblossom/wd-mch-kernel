@@ -524,6 +524,13 @@
 };
 
 &iso {
+	pwm: pwm@d0 {
+		compatible = "realtek,rtd129x-pwm";
+		reg = <0xd0 0xc>;
+		clocks = <&osc27M>;
+		#pwm-cells = <2>;
+	};
+
 	rtc@600 {
 		compatible = "realtek,rtd1295-rtc";
 		reg = <0x600 0x34>;
@@ -538,6 +545,24 @@
  */
 &rpc_comm {
 	no-map;
+};
+
+/ {
+	leds {
+		compatible = "pwm-leds";
+
+		/*
+		 * Front SYS LED, PWM channel 3. The boot loader leaves it at
+		 * 50 % duty, ~26 kHz; "keep" preserves that until userspace
+		 * changes brightness or attaches a trigger.
+		 */
+		led-sys {
+			label = "white:sys";
+			pwms = <&pwm 3 37926>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
 };
 
 / {

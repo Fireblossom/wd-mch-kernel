@@ -819,4 +819,11 @@ config PWM_XILINX
 	  To compile this driver as a module, choose M here: the module
 	  will be called pwm-xilinx.
 
+config PWM_RTD129X
+	bool "Realtek RTD129x PWM (vendor port)"
+	depends on ARCH_REALTEK
+	help
+	  The 4-channel PWM in the RTD129x ISO block. On the WD My Cloud
+	  Home channel 3 drives the front SYS LED.
+
 endif
