@@ -37,7 +37,7 @@
 	};
 
 	chosen {
-		bootargs = "earlycon=uart8250,mmio32,0x98007800 console=ttyS0,115200 root=/dev/sda9 rootfstype=ext4 rootwait rw init=/bin/sh";
+		bootargs = "earlycon=uart8250,mmio32,0x98007800 console=ttyS0,115200 panic=5";
 		stdout-path = "serial0:115200n8";
 	};
 

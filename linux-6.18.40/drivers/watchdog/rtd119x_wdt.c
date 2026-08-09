@@ -103,7 +103,14 @@ static const struct watchdog_ops rtd119x_wdt_ops = {
 
 static const struct watchdog_info rtd119x_wdt_info = {
 	.identity = "rtd119x-wdt",
-	.options = 0,
+	/*
+	 * The driver implements .ping and .set_timeout, but the watchdog
+	 * core gates the matching userspace ioctls on these capability
+	 * flags. Without them systemd's WDIOC_KEEPALIVE fails with
+	 * EOPNOTSUPP and the hardware watchdog is never fed.
+	 */
+	.options = WDIOF_KEEPALIVEPING | WDIOF_SETTIMEOUT |
+		   WDIOF_MAGICCLOSE,
 };
 
 static const struct of_device_id rtd119x_wdt_dt_ids[] = {
