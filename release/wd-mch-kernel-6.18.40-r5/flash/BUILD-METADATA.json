@@ -1,0 +1,31 @@
+{
+  "dtb": {
+    "additive_checksum": "0x00059546",
+    "file": "mch.dtb",
+    "padded_bytes": 28672,
+    "padded_fdt_totalsize": 28672,
+    "raw_bytes": 10797,
+    "raw_fdt_totalsize": 10797,
+    "sata_blocks": 56,
+    "sha256": "4c50d98b6e7a525c3d1ce17bddf9ac424ab48136b8954eb7135c964506145038"
+  },
+  "fw_table": {
+    "bytes": 8192,
+    "checksum": "0x42eb",
+    "file": "fw_table.bin",
+    "sha256": "cf1ea26227aeb3d0977795f86495109f8cf18f182333ddde2df701918119a0ad"
+  },
+  "image": {
+    "additive_checksum": "0x5e984621",
+    "file": "Image-6.18.40-mch",
+    "padded_bytes": 16715776,
+    "raw_bytes": 16713736,
+    "sata_blocks": 32648,
+    "sha256": "5f7f2e9a8cc744abbf27f6099c901498f0836f06ab85c9f86e011f7f48715580"
+  },
+  "kernel_version": "6.18.40",
+  "package": "wd-mch-kernel-6.18.40-r5",
+  "release": "r5",
+  "source_commit": "6abada7abda354d21f6246b49fd8537bbdd7cbef",
+  "source_date_epoch": 1786282792
+}

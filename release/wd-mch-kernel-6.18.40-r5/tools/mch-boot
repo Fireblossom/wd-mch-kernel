@@ -1,0 +1,109 @@
+#!/bin/sh
+# Select the WD My Cloud Home boot target from a running Debian system.
+set -e
+
+CFGDEV=/dev/sda18
+MNT=/run/mch-boot-cfg
+SELF=$(basename "$0")
+
+die() {
+	echo "$SELF: $*" >&2
+	exit 1
+}
+
+mount_cfg() {
+	mkdir -p "$MNT"
+	mountpoint -q "$MNT" || mount -t vfat "$CFGDEV" "$MNT" ||
+		die "cannot mount $CFGDEV (run as root?)"
+}
+
+umount_cfg() {
+	sync
+	mountpoint -q "$MNT" && umount "$MNT" || true
+}
+
+write_cfg() {
+	mount_cfg
+	cp "$MNT/bootConfig" "$MNT/bootConfig.bak" 2>/dev/null || true
+	printf '%s' "$1" > "$MNT/bootConfig"
+	printf '%s' "$1" | od -c | head -1
+	umount_cfg
+	echo "$SELF: bootConfig set to '$1'; reboot to take effect"
+}
+
+case "${1:-status}" in
+status)
+	mount_cfg
+	cfg=$(tr -d '\0' < "$MNT/bootConfig" 2>/dev/null || true)
+	umount_cfg
+	state=$(echo "$cfg" | cut -d: -f1)
+	case "$state" in
+	0) name="NO_OTA (boot committed slot)" ;;
+	1) name="INIT (commit A, boot A)" ;;
+	2) name="OTA_TRIGGERED (boot next slot)" ;;
+	3) name="OTA_PASSED (commit and boot next slot)" ;;
+	4) name="OTA_FAILED (boot committed slot)" ;;
+	5) name="RECOVERY (boot GOLD)" ;;
+	*) name="unknown" ;;
+	esac
+	echo "bootConfig     : $cfg"
+	echo "  bootState    : $state - $name"
+	echo "  next region  : $(echo "$cfg" | cut -d: -f2)"
+	echo "  boot attempts: $(echo "$cfg" | cut -d: -f3)"
+	echo "running kernel : $(uname -r)"
+	if [ -r /proc/device-tree/factory/cbr ]; then
+		echo "committed slot : $(tr -d '\0' < /proc/device-tree/factory/cbr)"
+	fi
+	;;
+a|A)
+	write_cfg "2:A:1:;"
+	;;
+b|B)
+	write_cfg "2:B:1:;"
+	;;
+commit)
+	mount_cfg
+	cfg=$(tr -d '\0' < "$MNT/bootConfig")
+	umount_cfg
+	nbr=$(echo "$cfg" | cut -d: -f2)
+	[ "$nbr" = "A" ] || [ "$nbr" = "B" ] ||
+		die "no slot is being trialled (next region is '$nbr')"
+	write_cfg "3:$nbr:0:;"
+	;;
+gold)
+	write_cfg "5:F:0:;"
+	;;
+netrescue|rescue)
+	mount_cfg
+	: > "$MNT/netrescue"
+	umount_cfg
+	echo "$SELF: one-shot network rescue armed for the next boot"
+	;;
+disarm)
+	mount_cfg
+	rm -f "$MNT/netrescue"
+	umount_cfg
+	echo "$SELF: network rescue disarmed"
+	;;
+normal)
+	write_cfg "0:F:0:;"
+	;;
+*)
+	cat <<USAGE
+usage: $SELF [status|a|b|commit|gold|rescue|disarm|normal]
+
+  status   show the current boot configuration
+  a        next boot: slot A
+  b        next boot: slot B
+  commit   make the slot currently being trialled permanent
+  gold     next boot: factory GOLD recovery
+  rescue   next boot: one-shot initramfs network rescue
+  disarm   cancel a pending network rescue
+  normal   clear a trial and boot the committed slot
+
+The bootloader does not automatically roll back a failed slot. Always preserve
+a known-good slot and the GOLD recovery partitions.
+USAGE
+	exit 1
+	;;
+esac
