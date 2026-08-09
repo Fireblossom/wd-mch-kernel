@@ -14,6 +14,8 @@
 #include <linux/platform_device.h>
 #include <linux/thermal.h>
 
+#include "thermal_hwmon.h"
+
 #define TM_SENSOR_CTRL2		0x08
 #define TM_SENSOR_STATUS1	0x18
 
@@ -60,6 +62,13 @@ static int rtd129x_thermal_probe(struct platform_device *pdev)
 	if (IS_ERR(tz))
 		return dev_err_probe(&pdev->dev, PTR_ERR(tz),
 				     "failed to register thermal zone\n");
+
+	/*
+	 * thermal_of registers DT zones with no_hwmon = true, so the zone
+	 * is invisible to lm-sensors unless the driver adds the hwmon
+	 * bridge itself (same pattern as qcom/tsens.c).
+	 */
+	devm_thermal_add_hwmon_sysfs(&pdev->dev, tz);
 
 	return 0;
 }
