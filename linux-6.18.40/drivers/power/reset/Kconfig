@@ -345,4 +345,12 @@ config POWER_MLXBF
 	help
 	  This driver supports reset or low power mode handling for Mellanox BlueField.
 
+config POWER_RESET_RTD129X
+	bool "Realtek RTD129x coolboot poweroff (vendor port)"
+	depends on ARCH_REALTEK
+	help
+	  Power off through the ACPU coolboot request in IPC shared
+	  memory, as the vendor 4.9 kernel does. Without this, poweroff
+	  halts but the board stays powered.
+
 endif

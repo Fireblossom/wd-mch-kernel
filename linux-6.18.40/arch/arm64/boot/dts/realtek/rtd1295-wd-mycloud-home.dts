@@ -532,6 +532,21 @@
 	};
 };
 
+/*
+ * The poweroff driver maps the RPC common region uncached (as the vendor
+ * kernel did); no-map keeps it out of the linear map so ioremap allows it.
+ */
+&rpc_comm {
+	no-map;
+};
+
+/ {
+	poweroff {
+		compatible = "realtek,rtd129x-coolboot-poweroff";
+		memory-region = <&rpc_comm>;
+	};
+};
+
 &crt {
 	scpu_clk: clock-controller@500 {
 		compatible = "realtek,rtd129x-scpu-clk";
