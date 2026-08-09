@@ -583,4 +583,11 @@ config CLK_FD_KUNIT_TEST
 	help
 	  Kunit test for the clk-fractional-divider type.
 
+config COMMON_CLK_RTD129X_SCPU
+	bool "Realtek RTD129x SCPU core clock (vendor port)"
+	depends on ARCH_REALTEK
+	help
+	  Post-divider control for the RTD1295/RTD1296 SCPU PLL, ported
+	  from the vendor 4.9 clk driver. Needed for cpufreq.
+
 endif

@@ -512,3 +512,58 @@
 		status = "okay";
 	};
 };
+
+&crt {
+	scpu_clk: clock-controller@500 {
+		compatible = "realtek,rtd129x-scpu-clk";
+		reg = <0x500 0x20>;
+		clocks = <&osc27M>;
+		#clock-cells = <0>;
+	};
+};
+
+/*
+ * cpufreq: divider-only scaling below the boot operating point.  The
+ * boot loader leaves PLL_SCPU at 1201.5 MHz with the post-divider at
+ * /2, so this board has always run at 600.75 MHz; the OPPs are that
+ * proven point and its half.  No opp-microvolt on purpose: the cpudvs
+ * rail is never touched, both OPPs are safe at whatever voltage the
+ * board booted with.
+ */
+&cpu0 {
+	clocks = <&scpu_clk>;
+	operating-points-v2 = <&cpu_opps>;
+};
+
+&cpu1 {
+	clocks = <&scpu_clk>;
+	operating-points-v2 = <&cpu_opps>;
+};
+
+&cpu2 {
+	clocks = <&scpu_clk>;
+	operating-points-v2 = <&cpu_opps>;
+};
+
+&cpu3 {
+	clocks = <&scpu_clk>;
+	operating-points-v2 = <&cpu_opps>;
+};
+
+/ {
+	cpu_opps: opp-table-cpu {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300375000 {
+			opp-hz = /bits/ 64 <300375000>;
+			clock-latency-ns = <150000>;
+		};
+
+		opp-600750000 {
+			opp-hz = /bits/ 64 <600750000>;
+			clock-latency-ns = <150000>;
+			opp-suspend;
+		};
+	};
+};
