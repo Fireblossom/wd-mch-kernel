@@ -811,6 +811,7 @@ static int rtk_i2c_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct rtk_i2c_dev *priv = NULL;
 	struct resource *res;
+	u32 i2c_num;
 	int ret;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
@@ -857,7 +858,18 @@ static int rtk_i2c_probe(struct platform_device *pdev)
 	priv->adap.algo = &rtk_i2c_algo;
 	priv->adap.owner = THIS_MODULE;
 	priv->adap.dev.of_node = np;
-	priv->adap.nr = of_alias_get_id(np, "i2c");
+	/*
+	 * The vendor DTS carries the bus index in "i2c-num"; an i2c alias is
+	 * only a fallback. The index also selects SDA_DEL_SHIFT[], so an
+	 * unchecked of_alias_get_id() error (-ENODEV, no aliases on this
+	 * board) became a wild negative array index and a dead readl.
+	 */
+	if (of_property_read_u32(np, "i2c-num", &i2c_num))
+		i2c_num = of_alias_get_id(np, "i2c");
+	if ((int)i2c_num < 0 || i2c_num >= ARRAY_SIZE(SDA_DEL_SHIFT))
+		return dev_err_probe(dev, -EINVAL,
+				     "no valid i2c-num or alias\n");
+	priv->adap.nr = i2c_num;
 	strscpy(priv->adap.name, "rtk i2c adapter", sizeof(priv->adap.name));
 
 	rtk_i2c_init_recovery_info(priv);

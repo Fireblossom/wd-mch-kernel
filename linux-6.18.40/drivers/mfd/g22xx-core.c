@@ -8,6 +8,7 @@
 
 #include <linux/regmap.h>
 #include <linux/mfd/core.h>
+#include <linux/module.h>
 #include <linux/mfd/g22xx.h>
 
 static struct mfd_cell g2227_devs[] = {
@@ -38,6 +39,11 @@ int g22xx_device_init(struct g22xx_device *gdev)
 	}
 	return 0;
 }
+EXPORT_SYMBOL_GPL(g22xx_device_init);
 
 void g22xx_device_exit(struct g22xx_device *gdev)
 {}
+EXPORT_SYMBOL_GPL(g22xx_device_exit);
+
+MODULE_DESCRIPTION("GMT G22xx PMIC MFD core");
+MODULE_LICENSE("GPL");

@@ -1,3 +1,4 @@
+#include <linux/module.h>
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * GMT-G22XX serise PMIC regulator core functions
@@ -251,6 +252,7 @@ int g22xx_regulator_set_state(struct regulator_dev *rdev, int is_coldboot)
 
 	return -EINVAL;
 }
+EXPORT_SYMBOL_GPL(g22xx_regulator_set_state);
 
 static struct regmap_field *create_regmap_field(
 		struct g22xx_regulator_device *grdev,
@@ -340,3 +342,6 @@ struct regulator_dev *g22xx_regulator_register(
 EXPORT_SYMBOL_GPL(g22xx_regulator_register);
 
 
+
+MODULE_DESCRIPTION("GMT G22xx regulator helpers");
+MODULE_LICENSE("GPL");
