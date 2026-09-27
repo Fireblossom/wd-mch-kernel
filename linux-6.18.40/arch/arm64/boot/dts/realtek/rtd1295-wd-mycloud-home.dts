@@ -582,12 +582,13 @@
 };
 
 /*
- * cpufreq: divider-only scaling below the boot operating point.  The
- * boot loader leaves PLL_SCPU at 1201.5 MHz with the post-divider at
- * /2, so this board has always run at 600.75 MHz; the OPPs are that
- * proven point and its half.  No opp-microvolt on purpose: the cpudvs
- * rail is never touched, both OPPs are safe at whatever voltage the
- * board booted with.
+ * cpufreq.  The boot loader leaves PLL_SCPU at 1201.5 MHz with the
+ * post-divider at /2, so this board has always run at 600.75 MHz.
+ * 300.375 and 600.75 MHz keep that PLL and only change the divider;
+ * 1100 MHz reprograms the PLL (see clk-rtd129x-scpu.c) and is backed
+ * by the soc-hot passive trip above.  No opp-microvolt on purpose: the
+ * cpudvs rail is never touched.  It reads 1.000 V (G2227 DC2), which
+ * covers 1.1 GHz (needs 0.9625 V) but not 1.2 GHz (needs 1.0125 V).
  */
 &cpu0 {
 	clocks = <&scpu_clk>;
